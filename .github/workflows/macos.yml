@@ -1,0 +1,68 @@
+
+name: Build EasyMix for macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CMake and Ninja
+        run: |
+          brew install cmake ninja
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build
+        run: |
+          cmake --build build --config Release --parallel 3
+
+      - name: Verify app
+        run: |
+          test -d build/EasyMix.app
+          file build/EasyMix.app/Contents/MacOS/EasyMix
+
+      - name: Package
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/EasyMix.app \
+            EasyMix-macOS-${{ matrix.arch }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyMix-macOS-${{ matrix.arch }}
+          path: EasyMix-macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 30
