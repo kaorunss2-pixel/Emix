@@ -3,13 +3,14 @@ cmake_minimum_required(VERSION 3.21)
 
 if(APPLE)
     project(EasyMix LANGUAGES C CXX OBJC OBJCXX)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "macOS deployment target")
 else()
     project(EasyMix LANGUAGES C CXX)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(APPLE)
     set(CMAKE_OBJCXX_STANDARD 17)
@@ -17,7 +18,7 @@ if(APPLE)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
 include(FetchContent)
@@ -58,7 +59,11 @@ FetchContent_Declare(vst3sdk
     GIT_REPOSITORY https://github.com/steinbergmedia/vst3sdk.git
     GIT_TAG v3.7.12_build_20
     GIT_SHALLOW TRUE
-    GIT_SUBMODULES "base;cmake;pluginterfaces;public.sdk"
+    GIT_SUBMODULES
+        base
+        cmake
+        pluginterfaces
+        public.sdk
     GIT_SUBMODULES_RECURSE FALSE
 )
 
@@ -76,10 +81,12 @@ if(NOT vst3sdk_POPULATED)
     )
 endif()
 
-if(APPLE AND TARGET sdk_hosting)
-    target_compile_options(sdk_hosting PRIVATE
-        "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>"
-    )
+if(NOT TARGET sdk_hosting)
+    message(FATAL_ERROR "VST3 SDK target sdk_hosting was not created.")
+endif()
+
+if(NOT TARGET sdk)
+    message(FATAL_ERROR "VST3 SDK target sdk was not created.")
 endif()
 
 add_library(imgui_lib STATIC
@@ -109,8 +116,41 @@ set(EASYMIX_SOURCES
 )
 
 if(APPLE)
+    set(VST3_HOSTING_DIR
+        "${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting"
+    )
+
+    set(VST3_PLUGPROVIDER
+        "${VST3_HOSTING_DIR}/plugprovider.cpp"
+    )
+
+    set(VST3_MAC_MODULE
+        "${VST3_HOSTING_DIR}/module_mac.mm"
+    )
+
+    if(NOT EXISTS "${VST3_PLUGPROVIDER}")
+        message(FATAL_ERROR
+            "Missing VST3 source: ${VST3_PLUGPROVIDER}"
+        )
+    endif()
+
+    if(NOT EXISTS "${VST3_MAC_MODULE}")
+        message(FATAL_ERROR
+            "Missing VST3 source: ${VST3_MAC_MODULE}"
+        )
+    endif()
+
     list(APPEND EASYMIX_SOURCES
         src/PlatformMac.mm
+        "${VST3_PLUGPROVIDER}"
+        "${VST3_MAC_MODULE}"
+    )
+
+    set_source_files_properties(
+        src/PlatformMac.mm
+        "${VST3_MAC_MODULE}"
+        PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc"
     )
 endif()
 
@@ -120,16 +160,12 @@ if(APPLE)
     )
 
     set_target_properties(EasyMix PROPERTIES
-        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in"
+        MACOSX_BUNDLE_INFO_PLIST
+            "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in"
         MACOSX_BUNDLE_BUNDLE_NAME "EasyMix Studio"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.easymix.studio"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
         MACOSX_BUNDLE_BUNDLE_VERSION "1"
-    )
-
-    set_source_files_properties(
-        src/PlatformMac.mm
-        PROPERTIES COMPILE_FLAGS "-fobjc-arc"
     )
 else()
     add_executable(EasyMix
@@ -138,9 +174,9 @@ else()
 endif()
 
 target_include_directories(EasyMix PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${miniaudio_SOURCE_DIR}
-    ${vst3sdk_SOURCE_DIR}
+    "${CMAKE_SOURCE_DIR}/src"
+    "${miniaudio_SOURCE_DIR}"
+    "${vst3sdk_SOURCE_DIR}"
 )
 
 target_compile_definitions(EasyMix PRIVATE
