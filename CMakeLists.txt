@@ -65,8 +65,10 @@ FetchContent_Declare(vst3sdk
 FetchContent_MakeAvailable(glfw imgui miniaudio)
 
 FetchContent_GetProperties(vst3sdk)
+
 if(NOT vst3sdk_POPULATED)
     FetchContent_Populate(vst3sdk)
+
     add_subdirectory(
         ${vst3sdk_SOURCE_DIR}
         ${vst3sdk_BINARY_DIR}
@@ -74,18 +76,10 @@ if(NOT vst3sdk_POPULATED)
     )
 endif()
 
-if(APPLE)
-    if(TARGET sdk_hosting)
-        target_sources(sdk_hosting PRIVATE
-            ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/plugprovider.cpp
-            ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/module_mac.mm
-        )
-
-        set_source_files_properties(
-            ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/module_mac.mm
-            PROPERTIES COMPILE_FLAGS "-fobjc-arc"
-        )
-    endif()
+if(APPLE AND TARGET sdk_hosting)
+    target_compile_options(sdk_hosting PRIVATE
+        "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>"
+    )
 endif()
 
 add_library(imgui_lib STATIC
@@ -105,7 +99,9 @@ target_include_directories(imgui_lib PUBLIC
 target_link_libraries(imgui_lib PUBLIC glfw)
 
 if(APPLE)
-    target_compile_definitions(imgui_lib PUBLIC GL_SILENCE_DEPRECATION)
+    target_compile_definitions(imgui_lib PUBLIC
+        GL_SILENCE_DEPRECATION
+    )
 endif()
 
 set(EASYMIX_SOURCES
