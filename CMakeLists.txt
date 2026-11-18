@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 
 if(APPLE)
-  project(EasyMix LANGUAGES C CXX OBJCXX)
+
+　project(EasyMix LANGUAGES C CXX OBJC OBJCXX)
   set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 else()
   project(EasyMix LANGUAGES C CXX)
