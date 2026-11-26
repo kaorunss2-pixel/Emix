@@ -50,14 +50,7 @@ jobs:
 
       - name: Build
         run: |
-          set -o pipefail
-          cmake --build build --config Release --parallel 3 2>&1 \
-            | tee build.log \
-            | grep -E "error:|fatal error:|Undefined symbols|ld: " | head -40 \
-            | while IFS= read -r line; do
-                echo "::error::$line"
-              done
-          exit "${PIPESTATUS[0]}"
+          cmake --build build --config Release --parallel 3
 
       - name: Verify app
         run: |
