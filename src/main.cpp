@@ -1,6 +1,7 @@
 #define GLFW_INCLUDE_NONE
 #define NOMINMAX
 
+#ifdef _WIN32
 #include <Windows.h>
 
 #ifndef CALLBACK
@@ -12,6 +13,15 @@
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
+#else
+#define GL_SILENCE_DEPRECATION
+#include "Platform.h"    // macOS compatibility layer (file dialogs, message box, ...)
+#include "Equalizer.h"
+#include <OpenGL/gl3.h>
+#include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_COCOA
+#include <GLFW/glfw3native.h>
+#endif
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_glfw.h>
@@ -44,6 +54,8 @@
 #include <sstream>
 #include <cstdint>
 #include <unordered_map>
+#if defined(_WIN32) && !defined(EASYMIX_CMAKE)
+// Visual Studio / vcpkg build (CMake links these libraries itself)
 #pragma comment(lib, "opengl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #ifdef _DEBUG
@@ -57,6 +69,15 @@
 #pragma comment(lib, VST3_LIB_DIR "base.lib")
 #pragma comment(lib, VST3_LIB_DIR "pluginterfaces.lib")
 #pragma comment(lib, "ole32.lib")
+#endif
+
+#ifdef __APPLE__
+// The Windows build used glfwGetWin32Window(); on macOS the "owner" is the NSWindow.
+static inline void* glfwGetWin32Window(GLFWwindow* w)
+{
+    return (void*)glfwGetCocoaWindow(w);
+}
+#endif
 
 void ApplyEasyMixStyle()
 {
@@ -405,6 +426,10 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);   // required on macOS
+    glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_TRUE);
+#endif
 
     GLFWwindow* window = glfwCreateWindow(
         1280,
@@ -428,6 +453,14 @@ int main()
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+#ifdef __APPLE__
+    // keep the layout file in ~/Library/Application Support/EasyMix (cwd is not writable in an .app)
+    static std::string imguiIniPath = plat::SupportDir().empty()
+        ? std::string("imgui.ini")
+        : plat::SupportDir() + "/imgui.ini";
+    io.IniFilename = imguiIniPath.c_str();
+#endif
 
     ApplyCubaseStyle();
 
