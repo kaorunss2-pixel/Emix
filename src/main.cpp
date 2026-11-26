@@ -197,7 +197,7 @@ struct AutomationPoint
     float time = 0.0f;
     float value = 1.0f;
 };
-struct Marker
+struct TimelineMarker
 {
     float beat = 0.0f;
     std::string name;
@@ -250,7 +250,7 @@ struct ProjectSnapshot
     std::vector<std::vector<std::shared_ptr<Vst3Plugin>>> vst;
     std::vector<AudioClip> clips;
     std::vector<MidiNote> notes;
-    std::vector<Marker> markers;
+    std::vector<TimelineMarker> markers;
     std::vector<float> sends;
     std::vector<synth::Setup> synths;
     BusSettings bus;
@@ -500,7 +500,7 @@ int main()
     bool showAutomation = true;
     std::vector<std::unique_ptr<AudioClip>> audioClips;
     std::vector<MidiNote> midiNotes;
-    std::vector<Marker> markers;
+    std::vector<TimelineMarker> markers;
     bool showMarkers = true;
     bool showBus = false;
 
@@ -1985,7 +1985,7 @@ int main()
                 {
                     for (size_t i = 0; i < nmk; ++i)
                     {
-                        Marker mk; in >> mk.beat >> std::quoted(mk.name);
+                        TimelineMarker mk; in >> mk.beat >> std::quoted(mk.name);
                         if (!in) break;
                         markers.push_back(mk);
                     }
@@ -2384,10 +2384,10 @@ int main()
         { "Zoom In", "Ctrl+=", [&] { zoomBy(1.15f); } },
         { "Zoom Out", "Ctrl+-", [&] { zoomBy(1.0f / 1.15f); } },
         { "Add Marker at Playhead", "M", [&] {
-            Marker mk; mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
+            TimelineMarker mk; mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
             mk.name = "Marker " + std::to_string(markers.size() + 1);
             markers.push_back(mk);
-            std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; }); } },
+            std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; }); } },
         { "Clear All Markers", "", [&] { markers.clear(); } },
         { "Copy Selected Clip", "Ctrl+C", [&] { copyClip(); } },
         { "Paste Clip at Playhead", "Ctrl+V", [&] { pasteClip(); } },
@@ -2793,11 +2793,11 @@ else audioError = "Select a track first."; } },
                 }
                 else if (!kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_M, false))
                 {
-                    Marker mk;
+                    TimelineMarker mk;
                     mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
                     mk.name = "Marker " + std::to_string(markers.size() + 1);
                     markers.push_back(mk);
-                    std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; });
+                    std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; });
                 }
                 else if (!kio.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_PageUp, false) || ImGui::IsKeyPressed(ImGuiKey_PageDown, false)))
                 {
@@ -4148,11 +4148,11 @@ else audioError = "Select a track first."; } },
 
             if (ImGui::Button("Add at Playhead (M)"))
             {
-                Marker mk;
+                TimelineMarker mk;
                 mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
                 mk.name = "Marker " + std::to_string(markers.size() + 1);
                 markers.push_back(mk);
-                std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; });
+                std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; });
             }
             ImGui::SameLine();
             ImGui::TextDisabled("PageUp / PageDown: prev / next");
