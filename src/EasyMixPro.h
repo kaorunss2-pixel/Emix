@@ -36,7 +36,8 @@ namespace pro
         int keyPitch[16] = {};
     };
 
-    // Push every MIDI packet of `list` into the queue, then dispose of it.
+#ifndef _WIN32
+    // Push every MIDI packet of `list` into the queue (CoreMIDI, macOS only).
     inline void ParseMidiPacketList(const MIDIPacketList* list,
         std::mutex& mtx, std::vector<MidiMsg>& q)
     {
@@ -76,6 +77,8 @@ namespace pro
         }
     }
 
+#endif
+
     class MidiIn
     {
     public:
@@ -86,6 +89,18 @@ namespace pro
         ~MidiIn() { close(); }
 
 #ifdef _WIN32
+
+        void refresh()
+        {
+            names.clear();
+            const UINT n = midiInGetNumDevs();
+            for (UINT i = 0; i < n; ++i)
+            {
+                MIDIINCAPSA c{};
+                names.push_back(midiInGetDevCapsA(i, &c, sizeof(c)) == MMSYSERR_NOERROR ? c.szPname : "?");
+            }
+            scanned = true;
+        }
 
         bool open(int idx)
         {
