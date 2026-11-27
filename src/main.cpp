@@ -1933,8 +1933,10 @@ int main()
                 }
             }
 
-            if (!MoveFileExA(tempPath.c_str(), path.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            // std::filesystem::rename replaces an existing target on Windows and macOS alike.
+            std::error_code finalizeError;
+            std::filesystem::rename(tempPath, path, finalizeError);
+            if (finalizeError)
             {
                 audioError = "Could not finalize project save. Previous project was kept.";
                 return;
