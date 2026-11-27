@@ -36,13 +36,19 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cmake --build build --config Release --parallel 3 2>&1 \
-            | tee build.log \
-            | grep -E "error|fatal" | head -40 \
-            | while IFS= read -r line; do
-                echo "::error::$line"
-              done
-          exit "${PIPESTATUS[0]}"
+          cmake --build build --config Release --parallel 3 > build.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            # Temporary: the Actions log blob is unreachable from the agent, so
+            # surface the tail of the build log as annotations.
+            grep -n "error" build.log | head -30 | while IFS= read -r line; do
+              echo "::error::${line//\%/%%}"
+            done
+            tail -40 build.log | while IFS= read -r line; do
+              echo "::error::TAIL ${line//\%/%%}"
+            done
+          fi
+          exit $status
 
       - name: Verify executable
         run: |
