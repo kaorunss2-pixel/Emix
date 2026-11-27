@@ -1,6 +1,7 @@
 #define GLFW_INCLUDE_NONE
 #define NOMINMAX
 
+#ifdef _WIN32
 #include <Windows.h>
 
 #ifndef CALLBACK
@@ -12,6 +13,15 @@
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
+#else
+#define GL_SILENCE_DEPRECATION
+#include "Platform.h"    // macOS compatibility layer (file dialogs, message box, ...)
+#include "Equalizer.h"
+#include <OpenGL/gl3.h>
+#include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_COCOA
+#include <GLFW/glfw3native.h>
+#endif
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_glfw.h>
@@ -48,6 +58,8 @@
 #include <sstream>
 #include <cstdint>
 #include <unordered_map>
+#if defined(_WIN32) && !defined(EASYMIX_CMAKE)
+// Visual Studio / vcpkg build (CMake links these libraries itself)
 #pragma comment(lib, "opengl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #ifdef _DEBUG
@@ -61,6 +73,15 @@
 #pragma comment(lib, VST3_LIB_DIR "base.lib")
 #pragma comment(lib, VST3_LIB_DIR "pluginterfaces.lib")
 #pragma comment(lib, "ole32.lib")
+#endif
+
+#ifdef __APPLE__
+// The Windows build used glfwGetWin32Window(); on macOS the "owner" is the NSWindow.
+static inline void* glfwGetWin32Window(GLFWwindow* w)
+{
+    return (void*)glfwGetCocoaWindow(w);
+}
+#endif
 
 void ApplyEasyMixStyle()
 {
@@ -180,7 +201,7 @@ struct AutomationPoint
     float time = 0.0f;
     float value = 1.0f;
 };
-struct Marker
+struct TimelineMarker
 {
     float beat = 0.0f;
     std::string name;
@@ -233,7 +254,7 @@ struct ProjectSnapshot
     std::vector<std::vector<std::shared_ptr<Vst3Plugin>>> vst;
     std::vector<AudioClip> clips;
     std::vector<MidiNote> notes;
-    std::vector<Marker> markers;
+    std::vector<TimelineMarker> markers;
     std::vector<float> sends;
     std::vector<synth::Setup> synths;
     BusSettings bus;
@@ -409,6 +430,10 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);   // required on macOS
+    glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_TRUE);
+#endif
 
     GLFWwindow* window = glfwCreateWindow(
         1280,
@@ -432,6 +457,14 @@ int main()
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+#ifdef __APPLE__
+    // keep the layout file in ~/Library/Application Support/EasyMix (cwd is not writable in an .app)
+    static std::string imguiIniPath = plat::SupportDir().empty()
+        ? std::string("imgui.ini")
+        : plat::SupportDir() + "/imgui.ini";
+    io.IniFilename = imguiIniPath.c_str();
+#endif
 
     ApplyCubaseStyle();
 
@@ -471,7 +504,7 @@ int main()
     bool showAutomation = true;
     std::vector<std::unique_ptr<AudioClip>> audioClips;
     std::vector<MidiNote> midiNotes;
-    std::vector<Marker> markers;
+    std::vector<TimelineMarker> markers;
     bool showMarkers = true;
     bool showBus = false;
 
@@ -1900,8 +1933,10 @@ int main()
                 }
             }
 
-            if (!MoveFileExA(tempPath.c_str(), path.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            // std::filesystem::rename replaces an existing target on Windows and macOS alike.
+            std::error_code finalizeError;
+            std::filesystem::rename(tempPath, path, finalizeError);
+            if (finalizeError)
             {
                 audioError = "Could not finalize project save. Previous project was kept.";
                 return;
@@ -2053,7 +2088,7 @@ int main()
                 {
                     for (size_t i = 0; i < nmk; ++i)
                     {
-                        Marker mk; in >> mk.beat >> std::quoted(mk.name);
+                        TimelineMarker mk; in >> mk.beat >> std::quoted(mk.name);
                         if (!in) break;
                         markers.push_back(mk);
                     }
@@ -2437,10 +2472,10 @@ int main()
         { "Zoom In", "Ctrl+=", [&] { zoomBy(1.15f); } },
         { "Zoom Out", "Ctrl+-", [&] { zoomBy(1.0f / 1.15f); } },
         { "Add Marker at Playhead", "M", [&] {
-            Marker mk; mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
+            TimelineMarker mk; mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
             mk.name = "Marker " + std::to_string(markers.size() + 1);
             markers.push_back(mk);
-            std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; }); } },
+            std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; }); } },
         { "Clear All Markers", "", [&] { markers.clear(); } },
         { "Copy Selected Clip", "Ctrl+C", [&] { copyClip(); } },
         { "Paste Clip at Playhead", "Ctrl+V", [&] { pasteClip(); } },
@@ -2875,11 +2910,11 @@ else audioError = "Select a track first."; } },
                 }
                 else if (!kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_M, false))
                 {
-                    Marker mk;
+                    TimelineMarker mk;
                     mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
                     mk.name = "Marker " + std::to_string(markers.size() + 1);
                     markers.push_back(mk);
-                    std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; });
+                    std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; });
                 }
                 else if (!kio.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_PageUp, false) || ImGui::IsKeyPressed(ImGuiKey_PageDown, false)))
                 {
@@ -4621,11 +4656,11 @@ else audioError = "Select a track first."; } },
 
             if (ImGui::Button("Add at Playhead (M)"))
             {
-                Marker mk;
+                TimelineMarker mk;
                 mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
                 mk.name = "Marker " + std::to_string(markers.size() + 1);
                 markers.push_back(mk);
-                std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; });
+                std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; });
             }
             ImGui::SameLine();
             ImGui::TextDisabled("PageUp / PageDown: prev / next");

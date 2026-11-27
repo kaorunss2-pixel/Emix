@@ -1,10 +1,14 @@
 #pragma once
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
 #include <Windows.h>
+#else
+#include "Platform.h"   // macOS: HWND = void* (NSWindow handle), editor window helpers
+#endif
 
 #include <algorithm>
 #include <array>
@@ -15,6 +19,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -170,13 +176,22 @@ inline std::vector<std::string> ScanVst3Folders()
 
     std::vector<std::string> found;
 
+#ifdef _WIN32
     const char* roots[] =
     {
         "C:\\Program Files\\Common Files\\VST3",
         "C:\\Program Files (x86)\\Common Files\\VST3"
     };
+#else
+    std::vector<std::string> roots =
+    {
+        "/Library/Audio/Plug-Ins/VST3"
+    };
+    if (const char* home = std::getenv("HOME"))
+        roots.push_back(std::string(home) + "/Library/Audio/Plug-Ins/VST3");
+#endif
 
-    for (const char* root : roots)
+    for (const auto& root : roots)
     {
         std::error_code ec;
 
@@ -1246,6 +1261,7 @@ public:
     // VST3 Editor
     // -------------------------------------------------
 
+#ifdef _WIN32
     bool openEditor(HWND owner)
     {
         if (hwnd)
@@ -1372,6 +1388,110 @@ public:
         }
     }
 
+#else
+    bool openEditor(HWND /*owner*/)
+    {
+        if (hwnd)
+        {
+            plat::ShowEditorWindow(hwnd);
+            return true;
+        }
+
+        if (!controller)
+        {
+            lastError = "Plugin has no editor controller.";
+            return false;
+        }
+
+        view = Steinberg::owned(
+            controller->createView(
+                Steinberg::Vst::ViewType::kEditor
+            )
+        );
+
+        if (!view)
+        {
+            lastError = "Plugin has no editor.";
+            return false;
+        }
+
+        if (view->isPlatformTypeSupported(
+            Steinberg::kPlatformTypeNSView) !=
+            Steinberg::kResultTrue)
+        {
+            lastError = "Editor does not support NSView.";
+            view = nullptr;
+            return false;
+        }
+
+        Steinberg::ViewRect r{};
+
+        if (view->getSize(&r) != Steinberg::kResultTrue)
+        {
+            lastError = "Could not get editor size.";
+            view = nullptr;
+            return false;
+        }
+
+        hwnd = plat::CreateEditorWindow(
+            name.c_str(),
+            r.getWidth(),
+            r.getHeight(),
+            &Vst3Plugin::onEditorCloseRequested,
+            this);
+
+        if (!hwnd)
+        {
+            lastError = "Could not create editor window.";
+            view = nullptr;
+            return false;
+        }
+
+        liveEditors().insert(this);
+
+        view->setFrame(&frame);
+
+        if (view->attached(
+            plat::EditorContentView(hwnd),
+            Steinberg::kPlatformTypeNSView) != Steinberg::kResultOk)
+        {
+            lastError = "Could not attach plugin editor.";
+            view->setFrame(nullptr);
+            view = nullptr;
+
+            liveEditors().erase(this);
+            plat::DestroyEditorWindow(hwnd);
+            hwnd = nullptr;
+
+            return false;
+        }
+
+        plat::ShowEditorWindow(hwnd);
+
+        return true;
+    }
+
+    void closeEditor()
+    {
+        liveEditors().erase(this);
+
+        if (view)
+        {
+            view->removed();
+            view->setFrame(nullptr);
+            view = nullptr;
+        }
+
+        if (hwnd)
+        {
+            void* h = hwnd;
+            hwnd = nullptr;
+
+            plat::DestroyEditorWindow(h);
+        }
+    }
+
+#endif
     // -------------------------------------------------
     // Shutdown
     // -------------------------------------------------
@@ -1566,6 +1686,7 @@ private:
             Steinberg::IPlugView* v,
             Steinberg::ViewRect* r) override
         {
+#ifdef _WIN32
             if (owner && owner->hwnd && r)
             {
                 RECT rc =
@@ -1598,6 +1719,16 @@ private:
                     v->onSize(r);
             }
 
+#else
+            if (owner && owner->hwnd && r)
+            {
+                plat::ResizeEditorWindow(owner->hwnd, r->getWidth(), r->getHeight());
+
+                if (v)
+                    v->onSize(r);
+            }
+
+#endif
             return Steinberg::kResultOk;
         }
 
@@ -1656,6 +1787,7 @@ private:
         }
     }
 
+#ifdef _WIN32
     // -------------------------------------------------
     // Editor window
     // -------------------------------------------------
@@ -1710,6 +1842,24 @@ private:
         }
     }
 
+#else
+    // Plugins whose editor window is currently open (guards against close requests that
+    // arrive after the plugin has already been destroyed).
+    static std::set<Vst3Plugin*>& liveEditors()
+    {
+        static std::set<Vst3Plugin*> editors;
+        return editors;
+    }
+
+    static void onEditorCloseRequested(void* self)
+    {
+        auto* plugin = static_cast<Vst3Plugin*>(self);
+
+        if (plugin && liveEditors().count(plugin))
+            plugin->closeEditor();
+    }
+
+#endif
 private:
 
     VST3::Hosting::Module::Ptr module;
@@ -1758,9 +1908,12 @@ private:
     bool componentActive = false;
     bool processing = false;
 
+#ifdef _WIN32
     DWORD editorStyle =
         WS_OVERLAPPED |
         WS_CAPTION |
         WS_SYSMENU |
         WS_MINIMIZEBOX;
+#else
+#endif
 };

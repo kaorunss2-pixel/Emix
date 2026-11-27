@@ -3,9 +3,13 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <Windows.h>
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
+#else
+#include <CoreMIDI/CoreMIDI.h>   // macOS MIDI input
+#endif
 #include <imgui.h>
 #include <algorithm>
 #include <cmath>
@@ -32,6 +36,46 @@ namespace pro
         int keyPitch[16] = {};
     };
 
+    // Push every MIDI packet of `list` into the queue, then dispose of it.
+    inline void ParseMidiPacketList(const MIDIPacketList* list,
+        std::mutex& mtx, std::vector<MidiMsg>& q)
+    {
+        if (!list) return;
+
+        const MIDIPacket* packet = &list->packet[0];
+
+        for (UInt32 i = 0; i < list->numPackets; ++i, packet = MIDIPacketNext(packet))
+        {
+            UInt16 k = 0;
+
+            while (k < packet->length)
+            {
+                const unsigned char status = packet->data[k];
+
+                // Skip system / realtime bytes and running-status data we cannot size.
+                if (status < 0x80) { ++k; continue; }
+
+                const int type = status & 0xF0;
+                const int nbytes = (type == 0xC0 || type == 0xD0) ? 2 : 3;
+
+                if (type == 0x80 || type == 0x90)
+                {
+                    if (k + 2 >= packet->length) break;
+
+                    const int d1 = packet->data[k + 1] & 0x7F;
+                    const int d2 = packet->data[k + 2] & 0x7F;
+                    const bool on = (type == 0x90 && d2 > 0);
+
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (q.size() < 4096)
+                        q.push_back({ on, d1, on ? d2 / 127.0f : 0.0f });
+                }
+
+                k = static_cast<UInt16>(k + nbytes);
+            }
+        }
+    }
+
     class MidiIn
     {
     public:
@@ -41,17 +85,7 @@ namespace pro
 
         ~MidiIn() { close(); }
 
-        void refresh()
-        {
-            names.clear();
-            const UINT n = midiInGetNumDevs();
-            for (UINT i = 0; i < n; ++i)
-            {
-                MIDIINCAPSA c{};
-                names.push_back(midiInGetDevCapsA(i, &c, sizeof(c)) == MMSYSERR_NOERROR ? c.szPname : "?");
-            }
-            scanned = true;
-        }
+#ifdef _WIN32
 
         bool open(int idx)
         {
@@ -74,6 +108,78 @@ namespace pro
             selected = -1;
         }
 
+#else   // macOS: CoreMIDI
+
+        void refresh()
+        {
+            names.clear();
+            sources.clear();
+
+            const ItemCount total = MIDIGetNumberOfSources();
+
+            for (ItemCount i = 0; i < total; ++i)
+            {
+                MIDIEndpointRef source = MIDIGetSource(i);
+                if (!source) continue;
+
+                CFStringRef name = nullptr;
+                if (MIDIObjectGetStringProperty(source, kMIDIPropertyDisplayName, &name) != noErr || !name)
+                    MIDIObjectGetStringProperty(source, kMIDIPropertyName, &name);
+
+                std::string label = "?";
+                if (name)
+                {
+                    char buf[256] = {};
+                    if (CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8))
+                        label = buf;
+                    CFRelease(name);
+                }
+
+                sources.push_back(source);
+                names.push_back(label);
+            }
+
+            scanned = true;
+        }
+
+        bool open(int idx)
+        {
+            close();
+            if (idx < 0 || idx >= static_cast<int>(sources.size())) return false;
+
+            MIDIClientRef newClient = 0;
+            if (MIDIClientCreate(CFSTR("EasyMix"), nullptr, nullptr, &newClient) != noErr)
+                return false;
+
+            MIDIPortRef newPort = 0;
+            if (MIDIInputPortCreate(newClient, CFSTR("EasyMix In"), &MidiIn::ReadProc, this, &newPort) != noErr)
+            {
+                MIDIClientDispose(newClient);
+                return false;
+            }
+
+            if (MIDIPortConnectSource(newPort, sources[idx], nullptr) != noErr)
+            {
+                MIDIPortDispose(newPort);
+                MIDIClientDispose(newClient);
+                return false;
+            }
+
+            client = newClient;
+            port = newPort;
+            selected = idx;
+            return true;
+        }
+
+        void close()
+        {
+            if (port) { MIDIPortDispose(port); port = 0; }
+            if (client) { MIDIClientDispose(client); client = 0; }
+            selected = -1;
+        }
+
+#endif
+
         std::vector<MidiMsg> drain()
         {
             std::lock_guard<std::mutex> lk(mtx);
@@ -83,10 +189,23 @@ namespace pro
         }
 
     private:
+#ifdef _WIN32
         HMIDIIN h = nullptr;
+#else
+        std::vector<MIDIEndpointRef> sources;
+        MIDIClientRef client = 0;
+        MIDIPortRef port = 0;
+
+        static void ReadProc(const MIDIPacketList* list, void* refCon, void*)
+        {
+            auto* self = static_cast<MidiIn*>(refCon);
+            if (self) ParseMidiPacketList(list, self->mtx, self->q);
+        }
+#endif
         std::mutex mtx;
         std::vector<MidiMsg> q;
 
+#ifdef _WIN32
         static void CALLBACK Proc(HMIDIIN, UINT msg, DWORD_PTR inst, DWORD_PTR p1, DWORD_PTR)
         {
             if (msg != MIM_DATA) return;
@@ -98,6 +217,7 @@ namespace pro
             if (self->q.size() < 4096)
                 self->q.push_back({ cmd == 0x90 && d2 > 0, d1, cmd == 0x90 && d2 > 0 ? d2 / 127.0f : 0.0f });
         }
+#endif
     };
 
     // Collects MIDI-in and PC keyboard notes. Call once per frame on the UI thread.

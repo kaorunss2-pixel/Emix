@@ -155,6 +155,9 @@ if(APPLE)
 endif()
 
 if(APPLE)
+    set(EASYMIX_VERSION "1.1" CACHE STRING "Bundle short version (CFBundleShortVersionString)")
+    set(EASYMIX_BUILD "2" CACHE STRING "Bundle build number (CFBundleVersion)")
+
     add_executable(EasyMix MACOSX_BUNDLE
         ${EASYMIX_SOURCES}
     )
@@ -164,8 +167,8 @@ if(APPLE)
             "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in"
         MACOSX_BUNDLE_BUNDLE_NAME "EasyMix Studio"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.easymix.studio"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
-        MACOSX_BUNDLE_BUNDLE_VERSION "1"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${EASYMIX_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${EASYMIX_BUILD}"
     )
 else()
     add_executable(EasyMix
@@ -207,6 +210,8 @@ if(WIN32)
         opengl32
         comdlg32
         ole32
+        winmm       # EasyMixPro.h: MME MIDI input (midiIn*)
+        shell32     # OpenUtauBridge.h: ShellExecuteA
     )
 
 elseif(APPLE)
@@ -222,6 +227,7 @@ elseif(APPLE)
         "-framework CoreAudio"
         "-framework AudioToolbox"
         "-framework AudioUnit"
+        "-framework CoreMIDI"
         "-framework UniformTypeIdentifiers"
     )
 endif()

@@ -3,14 +3,17 @@ name: Build EasyMix for macOS
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish the build as a GitHub release with this tag (e.g. v1.1.0). Leave empty to build only."
+        required: false
+        default: ""
   push:
     branches:
       - main
-    paths:
-      - 'src/**'
-      - 'cmake/**'
-      - 'CMakeLists.txt'
-      - '.github/workflows/macos.yml'
+    # A tag push (e.g. v1.1.0) also publishes a release with the zips.
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -70,3 +73,45 @@ jobs:
           path: EasyMix-macOS-${{ matrix.arch }}.zip
           if-no-files-found: error
           retention-days: 30
+
+  # Publishes both architectures as EasyMix-macOS-<arch>.zip assets on a tag.
+  # Runs only for tag pushes (e.g. `git push origin v1.1.0`).
+  release:
+    name: Publish release
+    needs: build
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') ||
+      startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ls -l artifacts
+
+          # No checkout in this job, so tell gh which repository to use.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # Refresh the macOS assets; Windows assets on the same release stay untouched.
+            gh release upload "$TAG" artifacts/*.zip --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" artifacts/*.zip \
+              --repo "$REPO" \
+              --target "$SHA" \
+              --title "EasyMix $TAG" \
+              --notes "macOS build for Apple Silicon (arm64) and Intel (x86_64)."
+          fi

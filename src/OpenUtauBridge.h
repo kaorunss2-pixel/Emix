@@ -8,9 +8,17 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
 #pragma comment(lib, "shell32.lib")
+#else
+#include <spawn.h>      // posix_spawnp (macOS: no ShellExecute)
+#include <sys/wait.h>
+#include <cerrno>
+#include <cstdlib>
+extern char** environ;
+#endif
 
 #include "PianoRoll.h"
 
@@ -104,6 +112,8 @@ namespace openutau_bridge
     inline bool Launch(const std::string& projectPath, const std::string& executablePath = {})
     {
         if (projectPath.empty()) return false;
+
+#ifdef _WIN32
         HINSTANCE result = nullptr;
         if (!executablePath.empty())
         {
@@ -115,5 +125,33 @@ namespace openutau_bridge
             result = ShellExecuteA(nullptr, "open", projectPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
         return reinterpret_cast<INT_PTR>(result) > 32;
+#else
+        // macOS: ask LaunchServices to open the path (or the given app) with `open`.
+        std::string target = executablePath.empty() ? std::string("open") : executablePath;
+
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(target.c_str()));
+
+        std::string flag;
+        if (!executablePath.empty())
+        {
+            flag = "-a";
+            argv.push_back(const_cast<char*>(flag.c_str()));
+        }
+
+        std::vector<std::string> storage;
+        storage.push_back(projectPath);
+        argv.push_back(const_cast<char*>(storage.back().c_str()));
+        argv.push_back(nullptr);
+
+        pid_t pid = 0;
+        const int rc = posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), environ);
+        if (rc != 0) return false;
+
+        // Reap the short-lived launcher without blocking the UI thread.
+        int status = 0;
+        waitpid(pid, &status, WNOHANG);
+        return true;
+#endif
     }
 }
