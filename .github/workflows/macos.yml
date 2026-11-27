@@ -97,14 +97,21 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           TAG: ${{ inputs.release_tag || github.ref_name }}
+          SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
           ls -l artifacts
-          if gh release view "$TAG" >/dev/null 2>&1; then
+
+          # No checkout in this job, so tell gh which repository to use.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             # Refresh the macOS assets; Windows assets on the same release stay untouched.
-            gh release upload "$TAG" artifacts/*.zip --clobber
+            gh release upload "$TAG" artifacts/*.zip --repo "$REPO" --clobber
           else
             gh release create "$TAG" artifacts/*.zip \
+              --repo "$REPO" \
+              --target "$SHA" \
               --title "EasyMix $TAG" \
-              --notes "macOS build (arm64 + x86_64)."
+              --notes "macOS build for Apple Silicon (arm64) and Intel (x86_64)."
           fi
