@@ -692,7 +692,8 @@ public:
         float* outputStereo,
         int frames,
         double bpm,
-        long long projectSamplePosition)
+        long long projectSamplePosition,
+        bool transportPlaying = true)
     {
         using namespace Steinberg;
         using namespace Steinberg::Vst;
@@ -775,10 +776,11 @@ public:
         ProcessContext ctx{};
 
         ctx.state =
-            ProcessContext::kPlaying |
             ProcessContext::kTempoValid |
             ProcessContext::kTimeSigValid |
             ProcessContext::kProjectTimeMusicValid;
+        if (transportPlaying)
+            ctx.state |= ProcessContext::kPlaying;
 
         ctx.sampleRate = sampleRate;
         ctx.projectTimeSamples = projectSamplePosition;
@@ -886,7 +888,8 @@ public:
         float* samples,
         int frames,
         double bpm,
-        long long projectSamplePosition)
+        long long projectSamplePosition,
+        bool transportPlaying = true)
     {
         if (instrument || !samples)
             return false;
@@ -905,7 +908,8 @@ public:
             effectScratch.data(),
             frames,
             bpm,
-            projectSamplePosition))
+            projectSamplePosition,
+            transportPlaying))
         {
             return false;
         }
