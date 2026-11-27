@@ -36,7 +36,8 @@ namespace pro
         int keyPitch[16] = {};
     };
 
-    // Push every MIDI packet of `list` into the queue, then dispose of it.
+#ifndef _WIN32
+    // Push every MIDI packet of `list` into the queue (CoreMIDI, macOS only).
     inline void ParseMidiPacketList(const MIDIPacketList* list,
         std::mutex& mtx, std::vector<MidiMsg>& q)
     {
@@ -75,6 +76,8 @@ namespace pro
             }
         }
     }
+
+#endif
 
     class MidiIn
     {
