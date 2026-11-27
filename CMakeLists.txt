@@ -222,6 +222,7 @@ elseif(APPLE)
         "-framework CoreAudio"
         "-framework AudioToolbox"
         "-framework AudioUnit"
+        "-framework CoreMIDI"
         "-framework UniformTypeIdentifiers"
     )
 endif()

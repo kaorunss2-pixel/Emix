@@ -1,16 +1,19 @@
 #pragma once
-// EasyMix Studio: UI extras (header only, no extra libraries)
+// EasyMix Studio - Modern UI Extras
+// Header-only ImGui components. Keeps the original public API.
 //  - SpectrumAnalyzer : realtime FFT spectrum of the master output
 //  - DrawEqGraph      : EQ response curve + spectrum, drag band nodes (freq/gain), wheel = Q, double click = reset gain
 //  - PeakHold / DrawMeterBar : dB scaled level meter with peak hold and clip colours
 //  - Toasts           : fading notifications (replaces the red status text)
 //  - CommandPalette   : Ctrl+P search & run any command
 //  - DrawShortcutsWindow : F1 cheat sheet
+// Visual refresh: midnight surfaces, cool-blue EQ accents, clearer meter/toast contrast.
 #include <imgui.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -120,27 +123,28 @@ inline bool DrawEqGraph(const char* id, Equalizer& eq, ImVec2 size,
     auto yg = [&](float y) { return std::clamp((0.5f - (y - p.y) / size.y) * 2.0f * range, -range, range); };
 
     static const ImU32 cols[Equalizer::BandCount] = {
-        IM_COL32(235, 100, 90, 255), IM_COL32(240, 170, 70, 255), IM_COL32(120, 210, 120, 255),
-        IM_COL32(90, 170, 240, 255), IM_COL32(180, 120, 230, 255) };
+        IM_COL32(255, 105, 125, 255), IM_COL32(255, 181, 92, 255),
+        IM_COL32(116, 220, 170, 255), IM_COL32(86, 190, 255, 255),
+        IM_COL32(190, 135, 255, 255) };
 
-    dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(16, 18, 22, 255), 3.0f);
+    dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(13, 17, 25, 255), 10.0f);
 
     // grid
     const float fl[] = { 50, 100, 200, 500, 1000, 2000, 5000, 10000 };
     for (float f : fl)
     {
         const float x = fx(f);
-        dl->AddLine(ImVec2(x, p.y), ImVec2(x, p.y + size.y), IM_COL32(40, 44, 52, 255));
+        dl->AddLine(ImVec2(x, p.y), ImVec2(x, p.y + size.y), IM_COL32(36, 47, 63, 190));
         char t[16];
         if (f >= 1000.0f) std::snprintf(t, sizeof(t), "%gk", f / 1000.0f); else std::snprintf(t, sizeof(t), "%g", f);
-        dl->AddText(ImVec2(x + 2, p.y + size.y - 14), IM_COL32(110, 116, 128, 255), t);
+        dl->AddText(ImVec2(x + 2, p.y + size.y - 14), IM_COL32(133, 151, 174, 255), t);
     }
     for (int g = -12; g <= 12; g += 6)
     {
         const float y = gy(static_cast<float>(g));
-        dl->AddLine(ImVec2(p.x, y), ImVec2(p.x + size.x, y), g == 0 ? IM_COL32(80, 86, 98, 255) : IM_COL32(36, 40, 48, 255));
+        dl->AddLine(ImVec2(p.x, y), ImVec2(p.x + size.x, y), g == 0 ? IM_COL32(91, 119, 150, 220) : IM_COL32(30, 40, 55, 190));
         char t[8]; std::snprintf(t, sizeof(t), "%+d", g);
-        dl->AddText(ImVec2(p.x + 3, y - 13), IM_COL32(110, 116, 128, 255), t);
+        dl->AddText(ImVec2(p.x + 3, y - 13), IM_COL32(133, 151, 174, 255), t);
     }
 
     // spectrum (-90 .. 0 dB)
@@ -155,7 +159,7 @@ inline bool DrawEqGraph(const char* id, Equalizer& eq, ImVec2 size,
             const int k = std::clamp(static_cast<int>(f / binHz), 1, bins - 1);
             const float v = std::clamp((spec->db[k] + 90.0f) / 90.0f, 0.0f, 1.0f);
             const ImVec2 q(p.x + x, p.y + size.y - v * size.y * 0.9f);
-            dl->AddRectFilled(ImVec2(q.x, q.y), ImVec2(q.x + 2, p.y + size.y), IM_COL32(70, 150, 210, 60));
+            dl->AddRectFilled(ImVec2(q.x, q.y), ImVec2(q.x + 2, p.y + size.y), IM_COL32(53, 173, 235, 48));
         }
         (void)prev;
     }
@@ -177,7 +181,7 @@ inline bool DrawEqGraph(const char* id, Equalizer& eq, ImVec2 size,
     }
     if (pts.size() > 1)
         dl->AddPolyline(pts.data(), static_cast<int>(pts.size()),
-            eq.enabled ? IM_COL32(255, 190, 80, 255) : IM_COL32(110, 110, 110, 255), 0, 2.0f);
+            eq.enabled ? IM_COL32(80, 205, 255, 255) : IM_COL32(100, 116, 139, 255), 0, 2.8f);
 
     // nodes
     ImGuiStorage* stg = ImGui::GetStateStorage();
@@ -220,8 +224,8 @@ inline bool DrawEqGraph(const char* id, Equalizer& eq, ImVec2 size,
     {
         const ImVec2 c(fx(eq.frequencies[b]), gy(eq.gains[b]));
         const bool act = (b == drag) || (drag < 0 && b == nearest && hovered);
-        dl->AddCircleFilled(c, act ? 8.0f : 6.0f, cols[b]);
-        dl->AddCircle(c, act ? 8.0f : 6.0f, IM_COL32(0, 0, 0, 200), 0, 1.5f);
+        dl->AddCircleFilled(c, act ? 9.0f : 7.0f, cols[b]);
+        dl->AddCircle(c, act ? 9.0f : 7.0f, IM_COL32(235, 245, 255, 220), 0, 2.0f);
         char t[8]; std::snprintf(t, sizeof(t), "%d", b + 1);
         dl->AddText(ImVec2(c.x - 3, c.y - 7), IM_COL32(10, 10, 10, 255), t);
     }
@@ -232,7 +236,7 @@ inline bool DrawEqGraph(const char* id, Equalizer& eq, ImVec2 size,
             b + 1, eq.frequencies[b], eq.gains[b], eq.qValues[b]);
     }
 
-    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(60, 64, 74, 255), 3.0f);
+    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(53, 75, 101, 230), 10.0f);
     ImGui::PopID();
     return changed;
 }
@@ -265,7 +269,7 @@ inline void DrawMeterBar(ImVec2 size, float level, PeakHold& ph, bool drawScale 
     ph.update(level, ImGui::GetIO().DeltaTime);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(10, 12, 14, 255));
+    dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(12, 18, 26, 255));
 
     const float v = MeterPos(level);
     const float zeroPos = MeterPos(1.0f), warnPos = MeterPos(0.5f);
@@ -275,9 +279,9 @@ inline void DrawMeterBar(ImVec2 size, float level, PeakHold& ph, bool drawScale 
             const float t = std::min(v, b);
             dl->AddRectFilled(ImVec2(p.x, p.y + size.y * (1.0f - t)), ImVec2(p.x + size.x, p.y + size.y * (1.0f - a)), col);
         };
-    seg(0.0f, warnPos, IM_COL32(80, 205, 115, 255));
-    seg(warnPos, zeroPos, IM_COL32(235, 205, 70, 255));
-    seg(zeroPos, 1.0f, IM_COL32(240, 70, 60, 255));
+    seg(0.0f, warnPos, IM_COL32(64, 210, 145, 255));
+    seg(warnPos, zeroPos, IM_COL32(255, 190, 75, 255));
+    seg(zeroPos, 1.0f, IM_COL32(255, 83, 105, 255));
 
     const float hy = p.y + size.y * (1.0f - MeterPos(ph.hold));
     dl->AddLine(ImVec2(p.x, hy), ImVec2(p.x + size.x, hy), IM_COL32(255, 255, 255, 230), 2.0f);
@@ -290,7 +294,7 @@ inline void DrawMeterBar(ImVec2 size, float level, PeakHold& ph, bool drawScale 
         }
     if (ph.clip)
         dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + 5.0f), IM_COL32(255, 40, 40, 255));
-    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(60, 64, 72, 255));
+    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(58, 78, 103, 255));
 }
 
 // ------------------------------------------------------------------ toasts
@@ -333,12 +337,12 @@ struct Toasts
             const ImVec2 sz(ts.x + 28.0f, ts.y + 18.0f);
             const ImVec2 mn(vp->WorkPos.x + vp->WorkSize.x - sz.x - 16.0f, y - sz.y);
             const ImVec2 mx(mn.x + sz.x, mn.y + sz.y);
-            const ImU32 acc = it.kind == 2 ? IM_COL32(235, 80, 70, 255)
-                : it.kind == 1 ? IM_COL32(90, 205, 120, 255) : IM_COL32(110, 170, 235, 255);
+            const ImU32 acc = it.kind == 2 ? IM_COL32(255, 91, 110, 255)
+                : it.kind == 1 ? IM_COL32(65, 215, 150, 255) : IM_COL32(75, 175, 255, 255);
             auto A = [&](ImU32 c) { return (c & 0x00FFFFFF) | (static_cast<ImU32>(((c >> 24) & 0xFF) * a) << 24); };
-            dl->AddRectFilled(mn, mx, A(IM_COL32(28, 30, 36, 245)), 5.0f);
-            dl->AddRectFilled(mn, ImVec2(mn.x + 4.0f, mx.y), A(acc), 5.0f);
-            dl->AddText(ImVec2(mn.x + 16.0f, mn.y + 9.0f), A(IM_COL32(235, 237, 242, 255)), it.text.c_str());
+            dl->AddRectFilled(mn, mx, A(IM_COL32(19, 27, 39, 248)), 9.0f);
+            dl->AddRectFilled(mn, ImVec2(mn.x + 4.0f, mx.y), A(acc), 9.0f);
+            dl->AddText(ImVec2(mn.x + 17.0f, mn.y + 9.0f), A(IM_COL32(235, 237, 242, 255)), it.text.c_str());
             y -= sz.y + 8.0f;
         }
     }
@@ -392,7 +396,7 @@ struct CommandPalette
         const ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + 90.0f),
             ImGuiCond_Always, ImVec2(0.5f, 0.0f));
-        ImGui::SetNextWindowSize(ImVec2(480.0f, 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(560.0f, 0.0f));
         ImGui::SetNextWindowFocus();
         if (ImGui::Begin("##palette", nullptr,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -400,7 +404,7 @@ struct CommandPalette
         {
             if (justOpened) { ImGui::SetKeyboardFocusHere(); justOpened = false; }
             ImGui::SetNextItemWidth(-1.0f);
-            ImGui::InputTextWithHint("##pf", "Type a command...  (Esc to close)", filter, sizeof(filter));
+            ImGui::InputTextWithHint("##pf", "Search commands...   Enter: Run   Esc: Close", filter, sizeof(filter));
 
             const std::string f = Lower(filter);
             std::vector<int> hit;

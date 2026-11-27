@@ -1,196 +1,738 @@
+
 #pragma once
-// EasyMix Studio: Standard MIDI File (.mid) import / export.
-// Import : all channels / tracks of the file are merged into ONE EasyMix track.
-// Export : the notes of one EasyMix track are written as a format-0 file (480 ticks per beat).
+
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <new>
 #include <string>
 #include <vector>
+#include <cmath>
 
-#include "PianoRoll.h"   // MidiNote
+#include "PianoRoll.h"
 
 namespace midifile
 {
+    struct ImportOptions
+    {
+        uint64_t maxFileBytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+        uint64_t maxNotes = 100000000ULL;
+    };
+
     struct ImportResult
     {
         bool ok = false;
         std::string error;
-        float bpm = 0.0f;      // first tempo event, 0 = none found
+
+        float bpm = 120.0f;
+
         int noteCount = 0;
+        uint64_t noteCount64 = 0;
+        uint64_t totalEvents = 0;
+        uint64_t unmatchedNoteOffs = 0;
+        uint64_t unfinishedNotes = 0;
+
+        uint64_t fileBytes = 0;
+
+        int format = 0;
+        int tracks = 0;
+        int ticksPerBeat = 480;
     };
 
-    inline uint32_t Be32(const unsigned char* p)
+    struct TrackReader
     {
-        return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
-    }
-    inline uint16_t Be16(const unsigned char* p)
-    {
-        return static_cast<uint16_t>((p[0] << 8) | p[1]);
-    }
+        std::ifstream& file;
+        uint64_t remaining;
 
-    // Reads a variable length quantity. Returns false on truncated data.
-    inline bool ReadVlq(const unsigned char*& p, const unsigned char* end, uint32_t& value)
-    {
-        value = 0;
-        for (int i = 0; i < 4; ++i)
+        bool ReadByte(uint8_t& value)
         {
-            if (p >= end) return false;
-            const unsigned char b = *p++;
-            value = (value << 7) | (b & 0x7F);
-            if (!(b & 0x80)) return true;
+            if (remaining == 0)
+                return false;
+
+            char c = 0;
+
+            if (!file.get(c))
+                return false;
+
+            value = static_cast<uint8_t>(
+                static_cast<unsigned char>(c));
+
+            --remaining;
+            return true;
         }
-        return false;
+
+        bool Skip(uint64_t count)
+        {
+            if (count > remaining)
+                return false;
+
+            char buffer[4096];
+
+            while (count > 0)
+            {
+                const uint64_t amount =
+                    std::min<uint64_t>(count, sizeof(buffer));
+
+                file.read(buffer, static_cast<std::streamsize>(amount));
+
+                if (!file)
+                    return false;
+
+                count -= amount;
+                remaining -= amount;
+            }
+
+            return true;
+        }
+
+        bool ReadVlq(uint32_t& value)
+        {
+            value = 0;
+
+            for (int i = 0; i < 4; ++i)
+            {
+                uint8_t b = 0;
+
+                if (!ReadByte(b))
+                    return false;
+
+                value = (value << 7) | (b & 0x7F);
+
+                if ((b & 0x80) == 0)
+                    return true;
+            }
+
+            return false;
+        }
+    };
+
+    struct PendingNote
+    {
+        uint64_t startTick = 0;
+        float velocity = 1.0f;
+    };
+
+    inline bool ReadExact(
+        std::ifstream& file,
+        void* destination,
+        size_t size)
+    {
+        file.read(
+            static_cast<char*>(destination),
+            static_cast<std::streamsize>(size));
+
+        return static_cast<bool>(file);
     }
 
-    // nextId: first free note id (is advanced). Notes are appended to `out`.
+    inline uint16_t ReadBe16(const uint8_t* p)
+    {
+        return
+            (static_cast<uint16_t>(p[0]) << 8) |
+            static_cast<uint16_t>(p[1]);
+    }
+
+    inline uint32_t ReadBe32(const uint8_t* p)
+    {
+        return
+            (static_cast<uint32_t>(p[0]) << 24) |
+            (static_cast<uint32_t>(p[1]) << 16) |
+            (static_cast<uint32_t>(p[2]) << 8) |
+            static_cast<uint32_t>(p[3]);
+    }
+
+    inline bool ReadTrack(
+        std::ifstream& file,
+        uint32_t trackSize,
+        int destinationTrack,
+        int& nextId,
+        std::vector<MidiNote>& output,
+        ImportResult& result,
+        const ImportOptions& options,
+        bool& tempoFound)
+    {
+        TrackReader reader{ file, trackSize };
+
+        std::array<
+            std::array<std::vector<PendingNote>, 128>,
+            16
+        > pending;
+
+        std::array<
+            std::array<size_t, 128>,
+            16
+        > pendingHead{};
+
+        uint8_t runningStatus = 0;
+        uint64_t absoluteTick = 0;
+
+        while (reader.remaining > 0)
+        {
+            uint32_t delta = 0;
+
+            if (!reader.ReadVlq(delta))
+            {
+                result.error = "Invalid MIDI delta time.";
+                return false;
+            }
+
+            if (absoluteTick >
+                std::numeric_limits<uint64_t>::max() - delta)
+            {
+                result.error = "MIDI tick overflow.";
+                return false;
+            }
+
+            absoluteTick += delta;
+
+            uint8_t first = 0;
+
+            if (!reader.ReadByte(first))
+            {
+                result.error = "Unexpected end of MIDI track.";
+                return false;
+            }
+
+            uint8_t status = 0;
+            uint8_t firstData = 0;
+            bool hasFirstData = false;
+
+            if (first & 0x80)
+            {
+                status = first;
+            }
+            else
+            {
+                if (runningStatus == 0)
+                {
+                    result.error = "Invalid MIDI running status.";
+                    return false;
+                }
+
+                status = runningStatus;
+                firstData = first;
+                hasFirstData = true;
+            }
+
+            ++result.totalEvents;
+
+            if (status == 0xFF)
+            {
+                runningStatus = 0;
+
+                uint8_t metaType = 0;
+                uint32_t length = 0;
+
+                if (!reader.ReadByte(metaType) ||
+                    !reader.ReadVlq(length))
+                {
+                    result.error = "Invalid MIDI meta event.";
+                    return false;
+                }
+
+                if (metaType == 0x51 && length >= 3)
+                {
+                    uint8_t tempoBytes[3];
+
+                    for (int i = 0; i < 3; ++i)
+                    {
+                        if (!reader.ReadByte(tempoBytes[i]))
+                        {
+                            result.error = "Invalid tempo event.";
+                            return false;
+                        }
+                    }
+
+                    const uint32_t microseconds =
+                        (static_cast<uint32_t>(tempoBytes[0]) << 16) |
+                        (static_cast<uint32_t>(tempoBytes[1]) << 8) |
+                        static_cast<uint32_t>(tempoBytes[2]);
+
+                    if (microseconds > 0 && !tempoFound)
+                    {
+                        result.bpm =
+                            60000000.0f /
+                            static_cast<float>(microseconds);
+
+                        tempoFound = true;
+                    }
+
+                    if (!reader.Skip(length - 3))
+                    {
+                        result.error = "Invalid tempo data length.";
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!reader.Skip(length))
+                    {
+                        result.error = "Invalid MIDI meta data length.";
+                        return false;
+                    }
+                }
+
+                if (metaType == 0x2F)
+                {
+                    if (!reader.Skip(reader.remaining))
+                    {
+                        result.error = "Invalid end-of-track event.";
+                        return false;
+                    }
+
+                    break;
+                }
+
+                continue;
+            }
+
+            if (status == 0xF0 || status == 0xF7)
+            {
+                runningStatus = 0;
+
+                uint32_t length = 0;
+
+                if (!reader.ReadVlq(length) ||
+                    !reader.Skip(length))
+                {
+                    result.error = "Invalid MIDI SysEx event.";
+                    return false;
+                }
+
+                continue;
+            }
+
+            if (status < 0x80 || status >= 0xF0)
+            {
+                result.error = "Unsupported MIDI system event.";
+                return false;
+            }
+
+            runningStatus = status;
+
+            const uint8_t command = status & 0xF0;
+            const uint8_t channel = status & 0x0F;
+
+            const int dataCount =
+                (command == 0xC0 || command == 0xD0) ? 1 : 2;
+
+            uint8_t data1 = 0;
+            uint8_t data2 = 0;
+
+            if (hasFirstData)
+            {
+                data1 = firstData;
+            }
+            else if (!reader.ReadByte(data1))
+            {
+                result.error = "Invalid MIDI channel event.";
+                return false;
+            }
+
+            if (dataCount == 2)
+            {
+                if (!reader.ReadByte(data2))
+                {
+                    result.error = "Invalid MIDI channel data.";
+                    return false;
+                }
+            }
+
+            if (data1 >= 128 || data2 >= 128)
+            {
+                result.error = "Invalid MIDI data byte.";
+                return false;
+            }
+
+            const bool noteOn =
+                command == 0x90 && data2 != 0;
+
+            const bool noteOff =
+                command == 0x80 ||
+                (command == 0x90 && data2 == 0);
+
+            if (noteOn)
+            {
+                auto& queue = pending[channel][data1];
+
+                queue.push_back({
+                    absoluteTick,
+                    static_cast<float>(data2) / 127.0f
+                });
+            }
+            else if (noteOff)
+            {
+                auto& queue = pending[channel][data1];
+                size_t& head = pendingHead[channel][data1];
+
+                if (head >= queue.size())
+                {
+                    ++result.unmatchedNoteOffs;
+                    continue;
+                }
+
+                const PendingNote start = queue[head++];
+
+                if (result.noteCount64 >= options.maxNotes)
+                {
+                    result.error = "Maximum MIDI note limit exceeded.";
+                    return false;
+                }
+
+                const uint64_t duration =
+                    absoluteTick >= start.startTick
+                    ? absoluteTick - start.startTick
+                    : 0;
+
+                const double ticksPerBeat =
+                    static_cast<double>(result.ticksPerBeat);
+
+                MidiNote note;
+
+                note.id = nextId++;
+                note.trackIndex = destinationTrack;
+                note.pitch = static_cast<int>(data1);
+
+                note.startBeat =
+                    static_cast<float>(
+                        static_cast<double>(start.startTick) /
+                        ticksPerBeat);
+
+                note.lengthBeats =
+                    static_cast<float>(
+                        static_cast<double>(duration) /
+                        ticksPerBeat);
+
+                note.lengthBeats =
+                    std::max(0.0625f, note.lengthBeats);
+
+                note.velocity = start.velocity;
+
+                output.push_back(note);
+
+                ++result.noteCount64;
+
+                if (result.noteCount64 >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<int>::max()))
+                {
+                    result.noteCount =
+                        std::numeric_limits<int>::max();
+                }
+                else
+                {
+                    result.noteCount =
+                        static_cast<int>(result.noteCount64);
+                }
+
+                if (head == queue.size())
+                {
+                    queue.clear();
+                    head = 0;
+                }
+            }
+        }
+
+        for (int channel = 0; channel < 16; ++channel)
+        {
+            for (int pitch = 0; pitch < 128; ++pitch)
+            {
+                const auto& queue = pending[channel][pitch];
+                const size_t head = pendingHead[channel][pitch];
+
+                if (queue.size() > head)
+                {
+                    result.unfinishedNotes +=
+                        static_cast<uint64_t>(queue.size() - head);
+                }
+            }
+        }
+
+        return true;
+    }
+
     inline ImportResult Import(
         const std::string& path,
         int trackIndex,
         int& nextId,
-        std::vector<MidiNote>& out)
+        std::vector<MidiNote>& output,
+        const ImportOptions& options)
     {
-        ImportResult res;
+        ImportResult result;
 
-        std::ifstream f(path, std::ios::binary);
-        if (!f) { res.error = "Could not open file."; return res; }
-        const std::vector<unsigned char> data(
-            (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const size_t originalSize = output.size();
+        const int originalNextId = nextId;
 
-        if (data.size() < 14 || std::string(data.begin(), data.begin() + 4) != "MThd")
+        try
         {
-            res.error = "Not a MIDI file.";
-            return res;
-        }
+            std::ifstream file(path, std::ios::binary);
 
-        const uint32_t headLen = Be32(&data[4]);
-        if (headLen < 6 || 8 + size_t(headLen) > data.size())
-        {
-            res.error = "Broken MIDI header.";
-            return res;
-        }
-
-        const uint16_t numTracks = Be16(&data[10]);
-        const uint16_t division = Be16(&data[12]);
-        if (division & 0x8000)
-        {
-            res.error = "SMPTE time division is not supported.";
-            return res;
-        }
-        if (division == 0)
-        {
-            res.error = "Invalid time division.";
-            return res;
-        }
-
-        const double tpb = static_cast<double>(division);
-        size_t pos = 8 + headLen;
-
-        for (uint16_t t = 0; t < numTracks && pos + 8 <= data.size(); ++t)
-        {
-            const bool isTrk = std::string(data.begin() + pos, data.begin() + pos + 4) == "MTrk";
-            const uint32_t len = Be32(&data[pos + 4]);
-            pos += 8;
-
-            const size_t chunkEnd = std::min(data.size(), pos + size_t(len));
-            if (!isTrk) { pos = chunkEnd; continue; }
-
-            const unsigned char* p = data.data() + pos;
-            const unsigned char* end = data.data() + chunkEnd;
-
-            struct Pending { double startTick; float vel; };
-            std::vector<Pending> pending[16][128];
-
-            uint64_t tick = 0;
-            unsigned char running = 0;
-
-            while (p < end)
+            if (!file)
             {
-                uint32_t delta = 0;
-                if (!ReadVlq(p, end, delta)) break;
-                tick += delta;
-                if (p >= end) break;
+                result.error = "Cannot open MIDI file.";
+                return result;
+            }
 
-                unsigned char status = *p;
-                if (status & 0x80) { ++p; if (status < 0xF0) running = status; }
-                else
-                {
-                    if (!running) break;
-                    status = running;
-                }
+            file.seekg(0, std::ios::end);
 
-                if (status == 0xFF)
-                {
-                    if (p >= end) break;
-                    const unsigned char type = *p++;
-                    uint32_t mlen = 0;
-                    if (!ReadVlq(p, end, mlen) || p + mlen > end) break;
-                    if (type == 0x51 && mlen == 3 && res.bpm <= 0.0f)
-                    {
-                        const uint32_t us = (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2];
-                        if (us > 0) res.bpm = static_cast<float>(60000000.0 / us);
-                    }
-                    p += mlen;
-                    if (type == 0x2F) break;
-                }
-                else if (status == 0xF0 || status == 0xF7)
-                {
-                    uint32_t slen = 0;
-                    if (!ReadVlq(p, end, slen) || p + slen > end) break;
-                    p += slen;
-                }
-                else
-                {
-                    const int kind = status & 0xF0;
-                    const int ch = status & 0x0F;
-                    const int need = (kind == 0xC0 || kind == 0xD0) ? 1 : 2;
-                    if (p + need > end) break;
-                    const int d1 = p[0] & 0x7F;
-                    const int d2 = need == 2 ? (p[1] & 0x7F) : 0;
-                    p += need;
+            const std::streamoff fileSize = file.tellg();
 
-                    if (kind == 0x90 && d2 > 0)
-                    {
-                        pending[ch][d1].push_back({ static_cast<double>(tick), d2 / 127.0f });
-                    }
-                    else if (kind == 0x80 || (kind == 0x90 && d2 == 0))
-                    {
-                        auto& v = pending[ch][d1];
-                        if (!v.empty())
-                        {
-                            const Pending on = v.front();
-                            v.erase(v.begin());
+            if (fileSize < 14)
+            {
+                result.error = "MIDI file is too small.";
+                return result;
+            }
 
-                            MidiNote n;
-                            n.id = nextId++;
-                            n.trackIndex = trackIndex;
-                            n.pitch = d1;
-                            n.startBeat = static_cast<float>(on.startTick / tpb);
-                            n.lengthBeats = std::max(0.0625f,
-                                static_cast<float>((static_cast<double>(tick) - on.startTick) / tpb));
-                            n.velocity = std::clamp(on.vel, 0.01f, 1.0f);
-                            out.push_back(n);
-                            ++res.noteCount;
-                        }
-                    }
+            result.fileBytes = static_cast<uint64_t>(fileSize);
+
+            if (result.fileBytes > options.maxFileBytes)
+            {
+                result.error = "MIDI file exceeds maximum file size.";
+                return result;
+            }
+
+            file.seekg(0, std::ios::beg);
+
+            uint8_t header[8];
+
+            if (!ReadExact(file, header, sizeof(header)))
+            {
+                result.error = "Cannot read MIDI header.";
+                return result;
+            }
+
+            if (header[0] != 'M' ||
+                header[1] != 'T' ||
+                header[2] != 'h' ||
+                header[3] != 'd')
+            {
+                result.error = "Invalid MIDI header.";
+                return result;
+            }
+
+            const uint32_t headerLength = ReadBe32(header + 4);
+
+            if (headerLength < 6 ||
+                headerLength > result.fileBytes - 8)
+            {
+                result.error = "Invalid MIDI header length.";
+                return result;
+            }
+
+            uint8_t headerData[6];
+
+            if (!ReadExact(file, headerData, 6))
+            {
+                result.error = "Cannot read MIDI header data.";
+                return result;
+            }
+
+            result.format = ReadBe16(headerData);
+            result.tracks = ReadBe16(headerData + 2);
+
+            const uint16_t division = ReadBe16(headerData + 4);
+
+            if (result.format > 1)
+            {
+                result.error =
+                    "Format 2 MIDI is not supported. "
+                    "Please convert it to Format 0 or Format 1.";
+
+                return result;
+            }
+
+            if (result.tracks <= 0)
+            {
+                result.error = "MIDI contains no tracks.";
+                return result;
+            }
+
+            if (division & 0x8000)
+            {
+                result.error =
+                    "SMPTE time division is not supported.";
+
+                return result;
+            }
+
+            if (division == 0)
+            {
+                result.error = "Invalid MIDI ticks per beat.";
+                return result;
+            }
+
+            result.ticksPerBeat = division;
+
+            if (headerLength > 6)
+            {
+                file.seekg(
+                    static_cast<std::streamoff>(headerLength - 6),
+                    std::ios::cur);
+
+                if (!file)
+                {
+                    result.error = "Invalid MIDI header extension.";
+                    return result;
                 }
             }
-            pos = chunkEnd;
+
+            bool tempoFound = false;
+
+            int loadedTracks = 0;
+
+            while (file &&
+                static_cast<uint64_t>(file.tellg()) <
+                result.fileBytes)
+            {
+                uint8_t chunkHeader[8];
+
+                if (!ReadExact(file, chunkHeader, 8))
+                    break;
+
+                const uint32_t chunkSize =
+                    ReadBe32(chunkHeader + 4);
+
+                const uint64_t currentPosition =
+                    static_cast<uint64_t>(file.tellg());
+
+                if (chunkSize > result.fileBytes - currentPosition)
+                {
+                    result.error = "Invalid MIDI chunk size.";
+                    throw std::runtime_error(result.error);
+                }
+
+                const bool isTrack =
+                    chunkHeader[0] == 'M' &&
+                    chunkHeader[1] == 'T' &&
+                    chunkHeader[2] == 'r' &&
+                    chunkHeader[3] == 'k';
+
+                if (!isTrack)
+                {
+                    file.seekg(
+                        static_cast<std::streamoff>(chunkSize),
+                        std::ios::cur);
+
+                    if (!file)
+                    {
+                        result.error = "Cannot skip MIDI chunk.";
+                        throw std::runtime_error(result.error);
+                    }
+
+                    continue;
+                }
+
+                if (!ReadTrack(
+                    file,
+                    chunkSize,
+                    trackIndex,
+                    nextId,
+                    output,
+                    result,
+                    options,
+                    tempoFound))
+                {
+                    throw std::runtime_error(result.error);
+                }
+
+                ++loadedTracks;
+            }
+
+            if (loadedTracks == 0)
+            {
+                result.error = "No MIDI tracks found.";
+                throw std::runtime_error(result.error);
+            }
+
+            result.ok = true;
+        }
+        catch (const std::bad_alloc&)
+        {
+            result.error =
+                "Not enough memory to load this MIDI file.";
+        }
+        catch (const std::exception& e)
+        {
+            if (result.error.empty())
+                result.error = e.what();
+        }
+        catch (...)
+        {
+            result.error = "Unknown MIDI import error.";
         }
 
-        res.ok = true;
-        return res;
+        if (!result.ok)
+        {
+            output.resize(originalSize);
+            nextId = originalNextId;
+            result.noteCount64 = 0;
+            result.noteCount = 0;
+        }
+
+        return result;
     }
 
-    inline void PutVlq(std::vector<unsigned char>& b, uint32_t v)
+    inline ImportResult Import(
+        const std::string& path,
+        int trackIndex,
+        int& nextId,
+        std::vector<MidiNote>& output)
     {
-        unsigned char tmp[5];
-        int n = 0;
-        tmp[n++] = v & 0x7F;
-        while (v >>= 7) tmp[n++] = static_cast<unsigned char>((v & 0x7F) | 0x80);
-        while (n--) b.push_back(tmp[n]);
+        return Import(
+            path,
+            trackIndex,
+            nextId,
+            output,
+            ImportOptions{});
     }
+
+    inline void PutVlq(
+        std::vector<uint8_t>& output,
+        uint32_t value)
+    {
+        uint8_t buffer[4];
+
+        int count = 0;
+
+        buffer[count++] = static_cast<uint8_t>(value & 0x7F);
+
+        while ((value >>= 7) != 0)
+        {
+            buffer[count++] =
+                static_cast<uint8_t>((value & 0x7F) | 0x80);
+        }
+
+        while (count > 0)
+            output.push_back(buffer[--count]);
+    }
+
+    inline void PutBe16(
+        std::vector<uint8_t>& output,
+        uint16_t value)
+    {
+        output.push_back(static_cast<uint8_t>(value >> 8));
+        output.push_back(static_cast<uint8_t>(value));
+    }
+
+    inline void PutBe32(
+        std::vector<uint8_t>& output,
+        uint32_t value)
+    {
+        output.push_back(static_cast<uint8_t>(value >> 24));
+        output.push_back(static_cast<uint8_t>(value >> 16));
+        output.push_back(static_cast<uint8_t>(value >> 8));
+        output.push_back(static_cast<uint8_t>(value));
+    }
+
+    struct ExportEvent
+    {
+        uint64_t tick = 0;
+        uint8_t pitch = 60;
+        uint8_t velocity = 100;
+        bool noteOn = false;
+    };
 
     inline bool Export(
         const std::string& path,
@@ -198,68 +740,176 @@ namespace midifile
         int trackIndex,
         float bpm)
     {
-        constexpr int kTpb = 480;
-
-        struct Ev { uint32_t tick; bool on; int pitch; int vel; };
-        std::vector<Ev> evs;
-        for (const auto& n : notes)
+        try
         {
-            if (n.trackIndex != trackIndex) continue;
-            const uint32_t s = static_cast<uint32_t>(std::max(0.0f, n.startBeat) * kTpb + 0.5f);
-            const uint32_t e = std::max(s + 1,
-                static_cast<uint32_t>((std::max(0.0f, n.startBeat) + std::max(0.0f, n.lengthBeats)) * kTpb + 0.5f));
-            const int vel = std::clamp(static_cast<int>(n.velocity * 127.0f + 0.5f), 1, 127);
-            const int pit = std::clamp(n.pitch, 0, 127);
-            evs.push_back({ s, true, pit, vel });
-            evs.push_back({ e, false, pit, 0 });
-        }
-        std::stable_sort(evs.begin(), evs.end(), [](const Ev& a, const Ev& b)
+            constexpr uint32_t TICKS_PER_BEAT = 480;
+
+            if (!std::isfinite(bpm) || bpm <= 0.0f)
+                bpm = 120.0f;
+
+            std::vector<ExportEvent> events;
+
+            for (const MidiNote& note : notes)
             {
-                if (a.tick != b.tick) return a.tick < b.tick;
-                return !a.on && b.on;   // note-off first
+                if (note.trackIndex != trackIndex)
+                    continue;
+
+                if (!std::isfinite(note.startBeat) ||
+                    !std::isfinite(note.lengthBeats))
+                    continue;
+
+                const double start =
+                    std::max(0.0, static_cast<double>(note.startBeat));
+
+                const double length =
+                    std::max(0.0625, static_cast<double>(note.lengthBeats));
+
+                const uint64_t startTick =
+                    static_cast<uint64_t>(
+                        start * TICKS_PER_BEAT);
+
+                const uint64_t endTick =
+                    static_cast<uint64_t>(
+                        (start + length) * TICKS_PER_BEAT);
+
+                const uint8_t pitch =
+                    static_cast<uint8_t>(
+                        std::clamp(note.pitch, 0, 127));
+
+                const uint8_t velocity =
+                    static_cast<uint8_t>(
+                        std::clamp(
+                            static_cast<int>(note.velocity * 127.0f),
+                            1,
+                            127));
+
+                events.push_back({
+                    startTick,
+                    pitch,
+                    velocity,
+                    true
+                });
+
+                events.push_back({
+                    std::max(startTick + 1, endTick),
+                    pitch,
+                    velocity,
+                    false
+                });
+            }
+
+            std::stable_sort(
+                events.begin(),
+                events.end(),
+                [](const ExportEvent& a, const ExportEvent& b)
+                {
+                    if (a.tick != b.tick)
+                        return a.tick < b.tick;
+
+                    return !a.noteOn && b.noteOn;
+                });
+
+            std::vector<uint8_t> track;
+
+            const uint32_t microseconds =
+                static_cast<uint32_t>(
+                    60000000.0 / static_cast<double>(bpm));
+
+            track.push_back(0x00);
+            track.push_back(0xFF);
+            track.push_back(0x51);
+            track.push_back(0x03);
+
+            track.push_back(
+                static_cast<uint8_t>(microseconds >> 16));
+
+            track.push_back(
+                static_cast<uint8_t>(microseconds >> 8));
+
+            track.push_back(
+                static_cast<uint8_t>(microseconds));
+
+            track.push_back(0x00);
+            track.push_back(0xFF);
+            track.push_back(0x58);
+            track.push_back(0x04);
+            track.push_back(0x04);
+            track.push_back(0x02);
+            track.push_back(0x18);
+            track.push_back(0x08);
+
+            uint64_t previousTick = 0;
+
+            for (const ExportEvent& event : events)
+            {
+                const uint64_t delta =
+                    event.tick >= previousTick
+                    ? event.tick - previousTick
+                    : 0;
+
+                if (delta > 0x0FFFFFFF)
+                    return false;
+
+                PutVlq(
+                    track,
+                    static_cast<uint32_t>(delta));
+
+                track.push_back(
+                    event.noteOn ? 0x90 : 0x80);
+
+                track.push_back(event.pitch);
+
+                track.push_back(
+                    event.noteOn ? event.velocity : 0);
+
+                previousTick = event.tick;
+            }
+
+            track.push_back(0x00);
+            track.push_back(0xFF);
+            track.push_back(0x2F);
+            track.push_back(0x00);
+
+            std::vector<uint8_t> file;
+
+            file.insert(file.end(), {
+                'M', 'T', 'h', 'd'
             });
 
-        std::vector<unsigned char> trk;
+            PutBe32(file, 6);
+            PutBe16(file, 0);
+            PutBe16(file, 1);
+            PutBe16(file, TICKS_PER_BEAT);
 
-        const uint32_t us = static_cast<uint32_t>(60000000.0 / std::clamp(bpm, 20.0f, 400.0f));
-        PutVlq(trk, 0);
-        trk.insert(trk.end(), { 0xFF, 0x51, 0x03,
-            static_cast<unsigned char>(us >> 16),
-            static_cast<unsigned char>(us >> 8),
-            static_cast<unsigned char>(us) });
-        PutVlq(trk, 0);
-        trk.insert(trk.end(), { 0xFF, 0x58, 0x04, 4, 2, 24, 8 });   // 4/4
+            file.insert(file.end(), {
+                'M', 'T', 'r', 'k'
+            });
 
-        uint32_t last = 0;
-        for (const auto& e : evs)
-        {
-            PutVlq(trk, e.tick - last);
-            last = e.tick;
-            trk.push_back(e.on ? 0x90 : 0x80);
-            trk.push_back(static_cast<unsigned char>(e.pitch));
-            trk.push_back(static_cast<unsigned char>(e.vel));
+            PutBe32(
+                file,
+                static_cast<uint32_t>(track.size()));
+
+            file.insert(
+                file.end(),
+                track.begin(),
+                track.end());
+
+            std::ofstream output(
+                path,
+                std::ios::binary);
+
+            if (!output)
+                return false;
+
+            output.write(
+                reinterpret_cast<const char*>(file.data()),
+                static_cast<std::streamsize>(file.size()));
+
+            return static_cast<bool>(output);
         }
-        PutVlq(trk, 0);
-        trk.insert(trk.end(), { 0xFF, 0x2F, 0x00 });
-
-        std::ofstream out(path, std::ios::binary);
-        if (!out) return false;
-
-        auto w32 = [&](uint32_t v)
-            {
-                const unsigned char b[4] = { static_cast<unsigned char>(v >> 24), static_cast<unsigned char>(v >> 16),
-                                             static_cast<unsigned char>(v >> 8), static_cast<unsigned char>(v) };
-                out.write(reinterpret_cast<const char*>(b), 4);
-            };
-        auto w16 = [&](uint16_t v)
-            {
-                const unsigned char b[2] = { static_cast<unsigned char>(v >> 8), static_cast<unsigned char>(v) };
-                out.write(reinterpret_cast<const char*>(b), 2);
-            };
-
-        out.write("MThd", 4); w32(6); w16(0); w16(1); w16(kTpb);
-        out.write("MTrk", 4); w32(static_cast<uint32_t>(trk.size()));
-        out.write(reinterpret_cast<const char*>(trk.data()), static_cast<std::streamsize>(trk.size()));
-        return static_cast<bool>(out);
+        catch (...)
+        {
+            return false;
+        }
     }
 }

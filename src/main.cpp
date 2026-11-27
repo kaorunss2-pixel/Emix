@@ -34,7 +34,11 @@
 #include "BuiltinSynth.h" // built-in instruments (113 presets, GM drum kits)
 #include "CubaseStyle.h" // Cubase-like look + helpers
 #include "MidiFile.h"    // Standard MIDI File import / export
+#include "OpenUtauBridge.h"
 #include "EasyMixUi.h"   // EQ graph / spectrum / meters / toasts / command palette
+#include "OtoMad.h"
+#include "EasyMixPro.h"   // MIDI input / MIDI rec / loudness normalize
+#include "EasyMixExtras.h" // MIDI generators / clip processing / loudness utilities
 
 #include <vector>
 #include <string>
@@ -434,7 +438,7 @@ int main()
     GLFWwindow* window = glfwCreateWindow(
         1280,
         720,
-        "EasyMix Studio 1.0",
+        "EasyMix Studio 1.1 | Vocal Workstation",
         nullptr,
         nullptr
     );
@@ -510,6 +514,20 @@ int main()
     bool showVstRack = true;
     int pianoRollVstSelection = 0;
     bool showPianoRoll = false;
+    bool showExtrasGenerator = false;
+    bool showClipExtras = false;
+    extras::ExtrasState extrasState;
+    bool showMidiTools = false;
+    extras::MidiToolsState midiToolsState;
+    bool showOtoMad = false;
+    otomad::State otoState;
+    bool showOpenUtauBridge = false;
+    bool openUtauAutoLaunch = true;
+    char openUtauLyrics[4096] = "あ";
+    std::string openUtauExecutable;
+    std::string lastUstxPath;
+    std::string openUtauRealtimePluginPath;
+    bool showInspector = true;
     bool snapEnabled = true;
 
     float snapBeat = 0.25f;
@@ -577,6 +595,14 @@ int main()
     masterLimiter.wet = 1.0f;
     bool masterLimiterOn = true;
     std::vector<float> trackSends(tracks.size(), 0.0f);
+    pro::MidiIn midiIn;
+    pro::LiveState live;
+    extras::LufsMeter lufs;
+    extras::CorrelationMeter corr;
+    bool exportNormalize = false;
+    float exportTargetLufs = -14.0f;
+    int audioBuffer = 512;
+    bool showMidiIn = true, showLoudness = true;
     BusSettings bus;
     EffectNode busFx;
     int busAppliedIndex = -1;
@@ -1360,6 +1386,12 @@ int main()
             masterPeakL = std::max(pkL, masterPeakL * 0.92f);
             masterPeakR = std::max(pkR, masterPeakR * 0.92f);
             spectrum.push(out, static_cast<unsigned>(n));
+            if (!exporting)
+            {
+                lufs.setup(kEngineRate);
+                lufs.process(out, static_cast<unsigned>(n));
+                corr.process(out, static_cast<unsigned>(n));
+            }
         };
 
     rt.render = [&](float* out, ma_uint32 frames)
@@ -1372,6 +1404,35 @@ int main()
                     previewEng.Render(out, static_cast<int>(frames));
                     for (ma_uint32 i = 0; i < frames * 2; ++i)
                         out[i] = std::clamp(out[i], -1.0f, 1.0f);
+                }
+
+                // Transport-only VST3 processing: send stopped/scrubbed playhead
+                // state to OpenUtau Bridge without routing its audio to the master.
+                if (frames <= 4096)
+                {
+                    static float transportSilence[4096 * 2] = {};
+                    const long long stoppedFrame = frameFromPlayhead();
+                    for (auto& chain : trackVst)
+                    {
+                        for (auto& plugin : chain)
+                        {
+                            if (!plugin || !plugin->isLoaded() || plugin->instrument)
+                                continue;
+                            std::string low = plugin->path;
+                            std::transform(low.begin(), low.end(), low.begin(),
+                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            if (low.find("openutau bridge") == std::string::npos &&
+                                low.find("openutau_bridge") == std::string::npos)
+                                continue;
+                            std::fill_n(transportSilence, static_cast<size_t>(frames) * 2, 0.0f);
+                            plugin->processRealtimeEffect(
+                                transportSilence,
+                                static_cast<int>(frames),
+                                bpm,
+                                stoppedFrame,
+                                false);
+                        }
+                    }
                 }
                 return;
             }
@@ -1425,26 +1486,28 @@ int main()
         };
 
     ma_device rtDevice = {};
-    {
-        ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
-        cfg.playback.format = ma_format_f32;
-        cfg.playback.channels = 2;
-        cfg.sampleRate = kEngineRate;
-        cfg.periodSizeInFrames = 1024;
-        cfg.periods = 3;
-        cfg.dataCallback = realtimeAudioCallback;
-        cfg.pUserData = &rt;
-
-        if (ma_device_init(nullptr, &cfg, &rtDevice) == MA_SUCCESS)
+    auto reopenAudio = [&](int frames)
         {
-            rtDeviceOk = true;
-            ma_device_start(&rtDevice);
-        }
-        else
-        {
-            audioError = "Audio output device initialization failed.";
-        }
-    }
+            const bool wasLocked = uiLock.owns_lock();
+            if (wasLocked) uiLock.unlock();   // avoid deadlock with the audio callback mutex
+            if (rtDeviceOk) { ma_device_uninit(&rtDevice); rtDeviceOk = false; }
+            ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
+            cfg.playback.format = ma_format_f32;
+            cfg.playback.channels = 2;
+            cfg.sampleRate = kEngineRate;
+            cfg.periodSizeInFrames = static_cast<ma_uint32>(frames);
+            cfg.periods = 2;
+            cfg.dataCallback = realtimeAudioCallback;
+            cfg.pUserData = &rt;
+            if (ma_device_init(nullptr, &cfg, &rtDevice) == MA_SUCCESS)
+            {
+                rtDeviceOk = true;
+                ma_device_start(&rtDevice);
+            }
+            else audioError = "Audio output device initialization failed.";
+            if (wasLocked) uiLock.lock();
+        };
+    reopenAudio(audioBuffer);
 
     auto startAllClips = [&]()
         {
@@ -1517,6 +1580,7 @@ int main()
 
     auto exportWav = [&]()
         {
+            char normMsg[96] = "WAV exported successfully!";
             const long long contentEnd = computeContentEnd();
             if (contentEnd <= 0)
             {
@@ -1560,6 +1624,12 @@ int main()
             contentEndFrame = savedEnd;
             exporting = false;
             flushPlugins();
+
+            if (exportNormalize)
+            {
+                const float db = pro::NormalizeToLufs(mixBuffer, kEngineRate, exportTargetLufs, -1.0f);
+                std::snprintf(normMsg, sizeof(normMsg), "WAV exported (%+.1f dB -> %.0f LUFS)", db, exportTargetLufs);
+            }
 
             for (float& sample : mixBuffer)
                 sample = std::clamp(sample, -1.0f, 1.0f);
@@ -1619,7 +1689,7 @@ int main()
                 return;
             }
 
-            audioError = "WAV exported successfully!";
+            audioError = normMsg;
         };
 
     auto exportStems = [&]()
@@ -1743,8 +1813,10 @@ int main()
                 d.lpstrDefExt = "emix"; d.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
                 if (!DialogSave(&d)) return; path = filePath;
             }
-            std::ofstream out(path, std::ios::binary);
-            if (!out) { audioError = "Could not save project."; return; }
+            const std::string tempPath = path + ".tmp";
+            const std::string backupPath = path + ".bak";
+            std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
+            if (!out) { audioError = "Could not create temporary project file."; return; }
             out << "EASYMIX 6\n" << std::setprecision(9) << bpm << ' ' << timelineZoom << ' ' << playheadPosition << ' ' << masterVolume << '\n';
             out << (loopEnabled ? 1 : 0) << ' ' << loopStartBeat << ' ' << loopEndBeat << ' '
                 << (metronomeOn ? 1 : 0) << ' ' << (masterLimiterOn ? 1 : 0) << ' ' << masterLimiter.amount << ' '
@@ -1840,7 +1912,36 @@ int main()
             }
             out << '\n';
 
-            currentProjectPath = path; audioError = "Project saved: " + path;
+            out.flush();
+            if (!out.good())
+            {
+                out.close();
+                audioError = "Project write failed. The previous project file was kept.";
+                return;
+            }
+            out.close();
+
+            std::error_code backupError;
+            if (std::filesystem::exists(path))
+            {
+                std::filesystem::copy_file(path, backupPath,
+                    std::filesystem::copy_options::overwrite_existing, backupError);
+                if (backupError)
+                {
+                    audioError = "Could not create project backup. Original project was kept.";
+                    return;
+                }
+            }
+
+            if (!MoveFileExA(tempPath.c_str(), path.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                audioError = "Could not finalize project save. Previous project was kept.";
+                return;
+            }
+
+            currentProjectPath = path;
+            audioError = "Project saved safely: " + path + (std::filesystem::exists(backupPath) ? "  |  Backup: .bak" : "");
             savedHash = projectHash();
         };
     auto loadProject = [&]()
@@ -2079,22 +2180,7 @@ int main()
             if (recordingState.active.load())
                 return;
 
-            char filePath[MAX_PATH] = {};
-            OPENFILENAMEA dialog = {};
-            dialog.lStructSize = sizeof(dialog);
-            dialog.hwndOwner = glfwGetWin32Window(window);
-            dialog.lpstrFile = filePath;
-            dialog.nMaxFile = MAX_PATH;
-            dialog.lpstrFilter =
-                "WAV Files\0*.wav\0All Files\0*.*\0";
-            dialog.lpstrDefExt = "wav";
-            dialog.Flags =
-                OFN_OVERWRITEPROMPT |
-                OFN_PATHMUSTEXIST;
-
-            if (!DialogSave(&dialog))
-                return;
-            recordingFilePath = filePath;
+            recordingFilePath = pro::NextTakePath(currentProjectPath);
 
             recordingStartSeconds =
                 playheadPosition * 240.0f /
@@ -2108,7 +2194,7 @@ int main()
                 );
 
             if (ma_encoder_init_file(
-                filePath,
+                recordingFilePath.c_str(),
                 &encoderConfig,
                 &recordingState.encoder
             ) != MA_SUCCESS)
@@ -2506,6 +2592,7 @@ else audioError = "Select a track first."; } },
                     }
                 }
                 if (ImGui::MenuItem("Export Stems...")) exportStems();
+                if (ImGui::MenuItem("Export OpenUtau USTX...")) showOpenUtauBridge = true;
                 if (ImGui::MenuItem("Export MIDI..."))
                 {
                     if (selectedTrack < 0 || selectedTrack >= static_cast<int>(tracks.size()))
@@ -2594,6 +2681,25 @@ else audioError = "Select a track first."; } },
                 ImGui::EndMenu();
             }
 
+            if (ImGui::BeginMenu("Vocal"))
+            {
+                if (ImGui::MenuItem("OpenUtau Bridge", "")) showOpenUtauBridge = true;
+                if (ImGui::MenuItem("Export Selected Track to USTX")) showOpenUtauBridge = true;
+                ImGui::EndMenu();
+            }
+
+            if (ImGui::BeginMenu("Extras"))
+            {
+                ImGui::MenuItem("Music Generator / Drum Sequencer", nullptr, &showExtrasGenerator);
+                ImGui::MenuItem("Selected Clip Processing", nullptr, &showClipExtras);
+                ImGui::MenuItem("MIDI Tools", nullptr, &showMidiTools);
+                ImGui::MenuItem("OtoMad Studio", nullptr, &showOtoMad);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Generate Chord Progression"))
+                    showExtrasGenerator = true;
+                ImGui::EndMenu();
+            }
+
             if (ImGui::BeginMenu("View"))
             {
                 ImGui::MenuItem("Mixer", nullptr, &showMixer);
@@ -2601,6 +2707,14 @@ else audioError = "Select a track first."; } },
                 ImGui::MenuItem("Markers", nullptr, &showMarkers);
                 ImGui::MenuItem("Send Bus", nullptr, &showBus);
                 ImGui::MenuItem("Piano Roll", nullptr, &showPianoRoll);
+                ImGui::MenuItem("Music Generator", nullptr, &showExtrasGenerator);
+                ImGui::MenuItem("Clip Processing", nullptr, &showClipExtras);
+                ImGui::MenuItem("MIDI Tools", nullptr, &showMidiTools);
+                ImGui::MenuItem("OtoMad Studio", nullptr, &showOtoMad);
+                ImGui::MenuItem("Channel Inspector", nullptr, &showInspector);
+                ImGui::MenuItem("MIDI Input", nullptr, &showMidiIn);
+                ImGui::MenuItem("Loudness", nullptr, &showLoudness);
+                ImGui::MenuItem("OpenUtau Bridge", nullptr, &showOpenUtauBridge);
                 ImGui::MenuItem("VST3 Rack", nullptr, &showVstRack);
                 ImGui::MenuItem("Auto-save (90s)", nullptr, &autoSave);
                 ImGui::Separator();
@@ -2733,6 +2847,7 @@ else audioError = "Select a track first."; } },
             ImGui::DockBuilderDockWindow("Timeline", dockIdMain);
             ImGui::DockBuilderDockWindow("Mixer", dockIdBottom);
             ImGui::DockBuilderDockWindow("Track Equalizer", dockIdRight);
+            ImGui::DockBuilderDockWindow("Channel Inspector", dockIdRight);
             ImGui::DockBuilderDockWindow("VST3 Rack", dockIdRight);
             ImGui::DockBuilderDockWindow("Effect Node Editor", dockIdBottom);
             ImGui::DockBuilderDockWindow("Piano Roll", dockIdBottom);
@@ -2753,7 +2868,7 @@ else audioError = "Select a track first."; } },
 
         {
             ImGuiIO& kio = ImGui::GetIO();
-            if (!kio.WantTextInput)
+            if (!kio.WantTextInput && (!live.kbdPiano || ImGui::IsKeyPressed(ImGuiKey_Space, false)))
             {
                 if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, true))
                 {
@@ -2851,6 +2966,49 @@ else audioError = "Select a track first."; } },
 
             seekRequested = false;
             contentEndFrame = computeContentEnd();
+        }
+
+        {
+            std::vector<pro::MidiMsg> ev;
+            pro::PollLive(live, midiIn, ev);
+            if (!playing) live.held.clear();
+            const bool liveTrackOk = selectedTrack >= 0 && selectedTrack < static_cast<int>(tracks.size());
+            const double liveFpb = 60.0 / std::max(1.0f, bpm) * kEngineRate;
+            for (const auto& lm : ev)
+            {
+                if (!liveTrackOk) break;
+                bool hasVst = false;
+                for (auto& pv : trackVst[selectedTrack])
+                    if (pv && pv->isLoaded() && pv->instrument) hasVst = true;
+                if (!hasVst)   // live play of VST3 instruments is not supported yet
+                {
+                    previewEng.SetRate(static_cast<float>(kEngineRate));
+                    if (lm.on) previewEng.NoteOn(synthSetup(selectedTrack), lm.pitch, lm.vel);
+                    else previewEng.NoteOff(lm.pitch);
+                }
+                if (live.midiRec && playing)
+                {
+                    const double lat = recordLatencyMs / 1000.0 * bpm / 60.0;
+                    const float beat = std::max(0.0f, static_cast<float>(playFrame / liveFpb - lat));
+                    if (lm.on) live.held[lm.pitch] = pro::Held{ snapToGrid(beat), lm.vel };
+                    else
+                    {
+                        auto it = live.held.find(lm.pitch);
+                        if (it != live.held.end())
+                        {
+                            MidiNote nn;
+                            nn.id = pianoRoll.nextId++;
+                            nn.trackIndex = selectedTrack;
+                            nn.pitch = lm.pitch;
+                            nn.startBeat = it->second.beat;
+                            nn.lengthBeats = std::max(0.0625f, beat - it->second.beat);
+                            nn.velocity = it->second.vel;
+                            midiNotes.push_back(nn);
+                            live.held.erase(it);
+                        }
+                    }
+                }
+            }
         }
 
         ImGui::Begin(
@@ -3035,6 +3193,26 @@ else audioError = "Select a track first."; } },
             ImGui::Combo("Export format", &exportBits, bitNames, IM_ARRAYSIZE(bitNames));
             ImGui::SetNextItemWidth(120.0f);
             ImGui::SliderFloat("Rec latency (ms)", &recordLatencyMs, 0.0f, 300.0f, "%.0f");
+            ImGui::Checkbox("Normalize on export", &exportNormalize);
+            if (exportNormalize)
+            {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(110.0f);
+                ImGui::SliderFloat("##lufs", &exportTargetLufs, -24.0f, -8.0f, "%.0f LUFS");
+            }
+            {
+                static const char* bufNames[] = { "128", "256", "512", "1024", "2048" };
+                static const int bufVals[] = { 128, 256, 512, 1024, 2048 };
+                int bi = 2;
+                for (int i = 0; i < 5; ++i) if (bufVals[i] == audioBuffer) bi = i;
+                ImGui::SetNextItemWidth(100.0f);
+                if (ImGui::Combo("Audio buffer", &bi, bufNames, 5))
+                {
+                    audioBuffer = bufVals[bi];
+                    stopAllClips();
+                    reopenAudio(audioBuffer);
+                }
+            }
         }
         ImGui::End();
 
@@ -3067,6 +3245,7 @@ else audioError = "Select a track first."; } },
             }
             else
             {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(CubaseTrackColor(i)));
                 if (ImGui::Selectable(
                     tracks[i].c_str(),
                     selectedTrack == i
@@ -3074,6 +3253,7 @@ else audioError = "Select a track first."; } },
                 {
                     selectedTrack = i;
                 }
+                ImGui::PopStyleColor();
 
                 if (ImGui::IsItemHovered() &&
                     ImGui::IsMouseDoubleClicked(
@@ -3192,6 +3372,332 @@ else audioError = "Select a track first."; } },
         if (ImGui::Button("Reset Faders")) resetFaders();
 
         ImGui::End();
+
+        if (showInspector)
+        {
+            ImGui::SetNextWindowSize(ImVec2(310.0f, 520.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Channel Inspector", &showInspector))
+            {
+                if (selectedTrack < 0 || selectedTrack >= static_cast<int>(tracks.size()))
+                {
+                    ImGui::TextDisabled("Select a channel in the Track Panel.");
+                }
+                else
+                {
+                    const int t = selectedTrack;
+                    ImGui::TextColored(ImVec4(0.95f, 0.62f, 0.20f, 1.0f), "CHANNEL %02d", t + 1);
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(tracks[t].c_str());
+                    ImGui::Separator();
+                    ImGui::TextDisabled("CHANNEL STRIP / ROUTING");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::SliderFloat("Volume", &trackVolumes[t], 0.0f, 2.0f, "%.2f");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::SliderFloat("Pan", &trackPans[t], -1.0f, 1.0f, "%.2f");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::SliderFloat("FX Send", &trackSends[t], 0.0f, 1.0f, "%.2f");
+                    ImGui::Columns(2, "inspector_ms", false);
+                    if (CubaseToggle("MUTE", trackMuted[t], ImVec2(-1, 28), IM_COL32(210, 75, 65, 255))) trackMuted[t] = !trackMuted[t];
+                    ImGui::NextColumn();
+                    if (CubaseToggle("SOLO", trackSolo[t], ImVec2(-1, 28), IM_COL32(220, 170, 55, 255))) trackSolo[t] = !trackSolo[t];
+                    ImGui::Columns(1);
+                    ImGui::Separator();
+                    ImGui::TextDisabled("SIGNAL FLOW");
+                    ImGui::BulletText("Input: Stereo / Engine");
+                    ImGui::BulletText("Insert FX: %d", t < static_cast<int>(effectGraphs.size()) ? static_cast<int>(effectGraphs[t].nodes.size()) : 0);
+                    ImGui::BulletText("VST3: %d", t < static_cast<int>(trackVst.size()) ? static_cast<int>(trackVst[t].size()) : 0);
+                    ImGui::BulletText("Output: Stereo Master");
+                    ImGui::Separator();
+                    ImGui::TextDisabled("METER / PEAK HOLD");
+                    if (t < static_cast<int>(trackPeak.size())) ImGui::ProgressBar(std::clamp(trackPeak[t], 0.0f, 1.0f), ImVec2(-1, 12), "");
+                    ImGui::ProgressBar(std::clamp(masterPeakL, 0.0f, 1.0f), ImVec2(-1, 10), "MASTER L");
+                    ImGui::ProgressBar(std::clamp(masterPeakR, 0.0f, 1.0f), ImVec2(-1, 10), "MASTER R");
+                    ImGui::Separator();
+                    ImGui::TextDisabled("PROJECT STATISTICS");
+                    int noteCount = 0, clipCount = 0;
+                    for (const auto& n : midiNotes) if (n.trackIndex == t) ++noteCount;
+                    for (const auto& c : audioClips) if (c && c->trackIndex == t) ++clipCount;
+                    ImGui::Text("MIDI Notes     %d", noteCount);
+                    ImGui::Text("Audio Clips    %d", clipCount);
+                    ImGui::Text("Automation     %d", t < static_cast<int>(trackAutomation.size()) ? static_cast<int>(trackAutomation[t].size()) : 0);
+                    if (ImGui::Button("Open EQ", ImVec2(-1, 25))) showMixer = true;
+                    if (ImGui::Button("Open VST3 Rack", ImVec2(-1, 25))) showVstRack = true;
+                    if (ImGui::Button("Open Piano Roll", ImVec2(-1, 25))) showPianoRoll = true;
+                }
+            }
+            ImGui::End();
+        }
+
+        if (showOpenUtauBridge)
+        {
+            ImGui::SetNextWindowSize(ImVec2(560.0f, 520.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("OpenUtau Vocal Bridge", &showOpenUtauBridge))
+            {
+                ImGui::TextColored(ImVec4(0.95f, 0.62f, 0.20f, 1.0f), "EASYMIX  <->  OPENUTAU");
+                ImGui::TextDisabled("OpenUtau USTX export + real-time VST3 bridge.");
+                ImGui::Separator();
+
+                ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.65f, 1.0f), "REAL-TIME OPENUTAU LINK");
+                ImGui::TextWrapped("Install the OpenUtau build with DAW Integration and the OpenUtau Bridge VST3. This button scans your VST3 folders and inserts the bridge on the selected track.");
+                if (ImGui::Button("SCAN + ADD REALTIME BRIDGE", ImVec2(260, 32)))
+                {
+                    vst3Found = ScanVst3Folders();
+                    openUtauRealtimePluginPath.clear();
+                    for (const auto& candidate : vst3Found)
+                    {
+                        std::string low = candidate;
+                        std::transform(low.begin(), low.end(), low.begin(),
+                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        if (low.find("openutau bridge") != std::string::npos ||
+                            low.find("openutau_bridge") != std::string::npos)
+                        {
+                            openUtauRealtimePluginPath = candidate;
+                            break;
+                        }
+                    }
+
+                    if (openUtauRealtimePluginPath.empty())
+                    {
+                        audioError = "OpenUtau Bridge VST3 was not found. Install the bridge plugin, then scan again.";
+                    }
+                    else
+                    {
+                        if (selectedTrack < 0 || selectedTrack >= static_cast<int>(tracks.size()))
+                        {
+                            addTrack();
+                            tracks[selectedTrack] = "OpenUtau Vocal";
+                        }
+
+                        bool alreadyLoaded = false;
+                        for (const auto& p : trackVst[selectedTrack])
+                        {
+                            if (!p) continue;
+                            std::string loadedPath = p->path;
+                            std::transform(loadedPath.begin(), loadedPath.end(), loadedPath.begin(),
+                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            if (loadedPath == openUtauRealtimePluginPath ||
+                                loadedPath.find("openutau bridge") != std::string::npos)
+                            {
+                                alreadyLoaded = true;
+                                break;
+                            }
+                        }
+
+                        if (alreadyLoaded)
+                        {
+                            audioError = "OpenUtau Bridge is already loaded on the selected track.";
+                        }
+                        else
+                        {
+                            auto bridgePlugin = std::make_shared<Vst3Plugin>();
+                            if (bridgePlugin->load(openUtauRealtimePluginPath, kEngineRate, 4096) &&
+                                !bridgePlugin->instrument)
+                            {
+                                trackVst[selectedTrack].push_back(bridgePlugin);
+                                audioError = "OpenUtau real-time bridge added. OpenUtau must be running with a saved project.";
+                                showVstRack = true;
+                                projectDirty = true;
+                            }
+                            else
+                            {
+                                audioError = "Could not load OpenUtau Bridge VST3: " + bridgePlugin->lastError;
+                            }
+                        }
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("OPEN VST3 RACK", ImVec2(150, 32)))
+                    showVstRack = true;
+                ImGui::TextDisabled("%s",
+                    openUtauRealtimePluginPath.empty()
+                    ? "Bridge plugin not scanned yet"
+                    : openUtauRealtimePluginPath.c_str());
+                ImGui::Separator();
+                if (selectedTrack < 0 || selectedTrack >= static_cast<int>(tracks.size()))
+                    ImGui::TextColored(ImVec4(1, 0.45f, 0.35f, 1), "Select the vocal MIDI track first.");
+                else
+                    ImGui::Text("Source Track: %s", tracks[selectedTrack].c_str());
+                ImGui::Text("Tempo: %.2f BPM", bpm);
+                ImGui::Text("Notes on selected track: %d", static_cast<int>(std::count_if(midiNotes.begin(), midiNotes.end(), [&](const MidiNote& n) { return n.trackIndex == selectedTrack; })));
+                ImGui::Separator();
+                ImGui::Text("Lyrics (space/comma separated; if omitted, あ is used)");
+                ImGui::InputTextMultiline("##openutau_lyrics", openUtauLyrics, sizeof(openUtauLyrics), ImVec2(-1, 105));
+                ImGui::Checkbox("Launch OpenUtau after export", &openUtauAutoLaunch);
+                ImGui::TextWrapped("The exported USTX contains note timing, pitch, lyrics and tempo. Select your singer/voicebank and phonemizer inside OpenUtau, then render the vocal WAV and bring it back into EasyMix.");
+                ImGui::Separator();
+                if (ImGui::Button("Locate OpenUtau.exe", ImVec2(160, 28)))
+                {
+                    char exe[MAX_PATH] = {};
+                    OPENFILENAMEA d = {}; d.lStructSize = sizeof(d); d.hwndOwner = glfwGetWin32Window(window);
+                    d.lpstrFile = exe; d.nMaxFile = MAX_PATH; d.lpstrFilter = "OpenUtau executable\0OpenUtau.exe\0Executable files\0*.exe\0All files\0*.*\0";
+                    d.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                    if (DialogOpen(&d)) openUtauExecutable = exe;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", openUtauExecutable.empty() ? "Use Windows .ustx file association" : openUtauExecutable.c_str());
+                auto parseLyrics = [&]()
+                    {
+                        std::vector<std::string> result;
+                        std::string raw(openUtauLyrics);
+                        std::string token;
+                        bool separated = raw.find_first_of(" ,\t\r\n") != std::string::npos;
+                        if (separated)
+                        {
+                            for (char c : raw)
+                            {
+                                if (c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n')
+                                {
+                                    if (!token.empty()) { result.push_back(token); token.clear(); }
+                                }
+                                else token.push_back(c);
+                            }
+                            if (!token.empty()) result.push_back(token);
+                        }
+                        else
+                        {
+                            for (size_t i = 0; i < raw.size();)
+                            {
+                                unsigned char c = static_cast<unsigned char>(raw[i]);
+                                size_t len = c < 0x80 ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+                                len = std::min(len, raw.size() - i);
+                                result.push_back(raw.substr(i, len));
+                                i += len;
+                            }
+                        }
+                        if (result.empty()) result.push_back("あ");
+                        return result;
+                    };
+                if (ImGui::Button("EXPORT USTX", ImVec2(160, 34)))
+                {
+                    if (selectedTrack < 0 || selectedTrack >= static_cast<int>(tracks.size())) audioError = "Select a vocal MIDI track first.";
+                    else
+                    {
+                        char fp[MAX_PATH] = "EasyMix_Vocal.ustx";
+                        OPENFILENAMEA d = {}; d.lStructSize = sizeof(d); d.hwndOwner = glfwGetWin32Window(window);
+                        d.lpstrFile = fp; d.nMaxFile = MAX_PATH; d.lpstrFilter = "OpenUtau Project\0*.ustx\0All files\0*.*\0";
+                        d.lpstrDefExt = "ustx"; d.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+                        if (DialogSave(&d))
+                        {
+                            auto lyrics = parseLyrics();
+                            if (openutau_bridge::ExportUstx(fp, midiNotes, selectedTrack, bpm, tracks[selectedTrack], lyrics))
+                            {
+                                lastUstxPath = fp;
+                                audioError = "OpenUtau USTX exported.";
+                                if (openUtauAutoLaunch && !openutau_bridge::Launch(lastUstxPath, openUtauExecutable)) audioError = "USTX exported, but OpenUtau could not be launched. Open the file manually.";
+                            }
+                            else audioError = "USTX export failed: selected track has no MIDI notes or file could not be written.";
+                        }
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("OPEN LAST USTX", ImVec2(160, 34)))
+                {
+                    if (lastUstxPath.empty() || !openutau_bridge::Launch(lastUstxPath, openUtauExecutable)) audioError = "Could not open the last USTX file.";
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("IMPORT RENDERED VOCAL WAV", ImVec2(220, 34))) importWav();
+                ImGui::Separator();
+                ImGui::TextWrapped("Real-time mode: add OpenUtau Bridge to a track, open a saved project in a DAW-integration-enabled OpenUtau build, choose the OpenUtau track in the plugin window, then press Play in EasyMix. OpenUtau remains a separate window; its rendered vocal parts are streamed to this track automatically.");
+                ImGui::TextDisabled("Offline fallback: EasyMix MIDI + lyrics -> USTX -> OpenUtau render WAV -> Import WAV.");
+            }
+            ImGui::End();
+        }
+
+        if (showExtrasGenerator)
+        {
+            ImGui::SetNextWindowSize(ImVec2(720.0f, 620.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Music Generator / Drum Sequencer", &showExtrasGenerator))
+            {
+                ImGui::TextDisabled("Create MIDI material directly on the selected track.");
+                ImGui::Separator();
+                const bool added = extras::DrawGeneratorUi(
+                    extrasState,
+                    midiNotes,
+                    selectedTrack,
+                    pianoRoll.nextId,
+                    pianoRoll.scaleRoot,
+                    pianoRoll.scaleType,
+                    playheadPosition * 4.0f / std::max(1.0f, timelineZoom)
+                );
+                if (added) projectDirty = true;
+            }
+            ImGui::End();
+        }
+
+        if (showOtoMad)
+        {
+            ImGui::SetNextWindowSize(ImVec2(520.0f, 640.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("OtoMad Studio", &showOtoMad))
+            {
+                if (otomad::DrawOtoMadUi(otoState, audioClips, selectedClipPtr, midiNotes, tracks,
+                    selectedTrack, trackMuted, bpm, kEngineRate,
+                    [&](AudioClip& c) { buildWaveform(c); }, [&]() { addTrack(); },
+                    [&]() { stopAllClips(); }, audioError))
+                    projectDirty = true;
+            }
+            ImGui::End();
+        }
+
+        if (showMidiTools)
+        {
+            ImGui::SetNextWindowSize(ImVec2(430.0f, 390.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("MIDI Tools", &showMidiTools))
+            {
+                const bool changed = extras::DrawMidiToolsUi(midiToolsState, midiNotes, selectedTrack);
+                if (changed) projectDirty = true;
+            }
+            ImGui::End();
+        }
+
+        if (showClipExtras)
+        {
+            ImGui::SetNextWindowSize(ImVec2(420.0f, 300.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Selected Clip Processing", &showClipExtras))
+            {
+                if (!selectedClipPtr || !selectedClipPtr->pcm)
+                {
+                    ImGui::TextDisabled("Select an audio clip in the timeline first.");
+                }
+                else
+                {
+                    ImGui::TextWrapped("Clip: %s", selectedClipPtr->name.c_str());
+                    ImGui::Text("Duration: %.2f sec", selectedClipPtr->duration);
+                    ImGui::Separator();
+                    auto refreshClip = [&]()
+                        {
+                            buildWaveform(*selectedClipPtr);
+                            projectDirty = true;
+                        };
+                    if (ImGui::Button("Reverse Audio"))
+                    {
+                        if (extras::EditClipPcm(*selectedClipPtr, kEngineRate, "_reversed", [](std::vector<float>& b) { extras::ReversePcm(b); })) refreshClip();
+                        else audioError = "Reverse failed.";
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Convert to Mono"))
+                    {
+                        if (extras::EditClipPcm(*selectedClipPtr, kEngineRate, "_mono", [](std::vector<float>& b) { extras::ToMonoPcm(b); })) refreshClip();
+                        else audioError = "Mono conversion failed.";
+                    }
+                    if (ImGui::Button("Remove Silence"))
+                    {
+                        if (extras::EditClipPcm(*selectedClipPtr, kEngineRate, "_trimmed", [](std::vector<float>& b) { extras::RemoveSilencePcm(b, kEngineRate); })) refreshClip();
+                        else audioError = "Silence removal failed.";
+                    }
+                    ImGui::Separator();
+                    ImGui::SliderFloat("Pitch (semitones)", &extrasState.pitchSemis, -12.0f, 12.0f, "%+.1f st");
+                    if (ImGui::Button("Apply Pitch (resample)"))
+                    {
+                        const float semis = extrasState.pitchSemis;
+                        if (std::abs(semis) < 0.001f) audioError = "Set a pitch amount first.";
+                        else if (extras::EditClipPcm(*selectedClipPtr, kEngineRate, "_pitch", [semis](std::vector<float>& b) { extras::PitchResamplePcm(b, semis); })) refreshClip();
+                        else audioError = "Pitch processing failed.";
+                    }
+                    ImGui::TextWrapped("Pitch resampling changes both pitch and duration. The processed audio is saved as a new WAV file.");
+                }
+            }
+            ImGui::End();
+        }
 
         if (showMixer)
         {
@@ -4189,6 +4695,18 @@ else audioError = "Select a track first."; } },
             ImGui::End();
         }
 
+        if (showMidiIn)
+        {
+            ImGui::SetNextWindowSize(ImVec2(420.0f, 260.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("MIDI Input", &showMidiIn)) pro::DrawMidiPanel(live, midiIn);
+            ImGui::End();
+        }
+        if (showLoudness)
+        {
+            if (ImGui::Begin("Loudness", &showLoudness)) extras::DrawLoudnessPanel(lufs, corr);
+            ImGui::End();
+        }
+
         ImGui::Begin("Timeline");
 
         ImGui::Text("ARRANGEMENT");
@@ -5024,7 +5542,7 @@ else audioError = "Select a track first."; } },
 
             if (projectDirty != lastTitleDirty)
             {
-                glfwSetWindowTitle(window, projectDirty ? "*EasyMix Studio 1.0" : "EasyMix Studio 1.0");
+                glfwSetWindowTitle(window, projectDirty ? "*EasyMix Studio 1.0" : "EasyMix Studio 1.1 | Vocal Workstation");
                 lastTitleDirty = projectDirty;
             }
         }
