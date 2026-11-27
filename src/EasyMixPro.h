@@ -90,6 +90,18 @@ namespace pro
 
 #ifdef _WIN32
 
+        void refresh()
+        {
+            names.clear();
+            const UINT n = midiInGetNumDevs();
+            for (UINT i = 0; i < n; ++i)
+            {
+                MIDIINCAPSA c{};
+                names.push_back(midiInGetDevCapsA(i, &c, sizeof(c)) == MMSYSERR_NOERROR ? c.szPname : "?");
+            }
+            scanned = true;
+        }
+
         bool open(int idx)
         {
             close();
