@@ -210,6 +210,8 @@ if(WIN32)
         opengl32
         comdlg32
         ole32
+        winmm       # EasyMixPro.h: MME MIDI input (midiIn*)
+        shell32     # OpenUtauBridge.h: ShellExecuteA
     )
 
 elseif(APPLE)

@@ -1,0 +1,101 @@
+
+name: Build EasyMix for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish the build as a GitHub release with this tag (e.g. v1.1.0). Leave empty to build only."
+        required: false
+        default: ""
+  push:
+    branches:
+      - main
+    # A tag push (e.g. v1.1.0) also publishes a release with the zip.
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build build --config Release --parallel 3
+
+      - name: Verify executable
+        run: |
+          if (-not (Test-Path "build/Release/EasyMix.exe")) {
+            Write-Error "build/Release/EasyMix.exe was not produced"
+            exit 1
+          }
+          Get-Item "build/Release/EasyMix.exe" | Format-List Name,Length
+
+      - name: Package
+        run: |
+          # Everything the exe needs sits next to it in build/Release.
+          Compress-Archive -Path "build/Release/*" `
+            -DestinationPath "EasyMix-Windows-x64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyMix-Windows-x64
+          path: EasyMix-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # Publishes EasyMix-Windows-x64.zip on a tag. Assets uploaded by the macOS
+  # workflow are left untouched.
+  release:
+    name: Publish release
+    needs: build
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') ||
+      startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ls -l artifacts
+
+          # No checkout in this job, so tell gh which repository to use.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # Refresh the Windows asset; other assets on the release stay untouched.
+            gh release upload "$TAG" artifacts/*.zip --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" artifacts/*.zip \
+              --repo "$REPO" \
+              --target "$SHA" \
+              --title "EasyMix $TAG" \
+              --notes "Windows x64 build."
+          fi
