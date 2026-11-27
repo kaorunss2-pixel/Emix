@@ -115,40 +115,40 @@ set(EASYMIX_SOURCES
     src/main.cpp
 )
 
+# The SDK ships sdk_hosting without plugprovider.cpp and without the
+# platform Module backend, so the host has to compile those itself.
+set(VST3_HOSTING_DIR
+    "${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting"
+)
+
+set(VST3_HOSTING_EXTRA_SOURCES
+    "${VST3_HOSTING_DIR}/plugprovider.cpp"
+)
+
 if(APPLE)
-    set(VST3_HOSTING_DIR
-        "${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting"
-    )
-
-    set(VST3_PLUGPROVIDER
-        "${VST3_HOSTING_DIR}/plugprovider.cpp"
-    )
-
-    set(VST3_MAC_MODULE
+    list(APPEND VST3_HOSTING_EXTRA_SOURCES
         "${VST3_HOSTING_DIR}/module_mac.mm"
     )
-
-    if(NOT EXISTS "${VST3_PLUGPROVIDER}")
-        message(FATAL_ERROR
-            "Missing VST3 source: ${VST3_PLUGPROVIDER}"
-        )
-    endif()
-
-    if(NOT EXISTS "${VST3_MAC_MODULE}")
-        message(FATAL_ERROR
-            "Missing VST3 source: ${VST3_MAC_MODULE}"
-        )
-    endif()
-
-    list(APPEND EASYMIX_SOURCES
-        src/PlatformMac.mm
-        "${VST3_PLUGPROVIDER}"
-        "${VST3_MAC_MODULE}"
+elseif(WIN32)
+    list(APPEND VST3_HOSTING_EXTRA_SOURCES
+        "${VST3_HOSTING_DIR}/module_win32.cpp"
     )
+endif()
+
+foreach(vst3_source IN LISTS VST3_HOSTING_EXTRA_SOURCES)
+    if(NOT EXISTS "${vst3_source}")
+        message(FATAL_ERROR "Missing VST3 source: ${vst3_source}")
+    endif()
+endforeach()
+
+list(APPEND EASYMIX_SOURCES ${VST3_HOSTING_EXTRA_SOURCES})
+
+if(APPLE)
+    list(APPEND EASYMIX_SOURCES src/PlatformMac.mm)
 
     set_source_files_properties(
         src/PlatformMac.mm
-        "${VST3_MAC_MODULE}"
+        "${VST3_HOSTING_DIR}/module_mac.mm"
         PROPERTIES
         COMPILE_OPTIONS "-fobjc-arc"
     )
