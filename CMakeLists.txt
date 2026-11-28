@@ -115,15 +115,15 @@ set(EASYMIX_SOURCES
     src/main.cpp
 )
 
+set(VST3_HOSTING_DIR
+    "${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting"
+)
+
+set(VST3_PLUGPROVIDER
+    "${VST3_HOSTING_DIR}/plugprovider.cpp"
+)
+
 if(APPLE)
-    set(VST3_HOSTING_DIR
-        "${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting"
-    )
-
-    set(VST3_PLUGPROVIDER
-        "${VST3_HOSTING_DIR}/plugprovider.cpp"
-    )
-
     set(VST3_MAC_MODULE
         "${VST3_HOSTING_DIR}/module_mac.mm"
     )
@@ -151,6 +151,29 @@ if(APPLE)
         "${VST3_MAC_MODULE}"
         PROPERTIES
         COMPILE_OPTIONS "-fobjc-arc"
+    )
+endif()
+
+if(WIN32)
+    set(VST3_WIN_MODULE
+        "${VST3_HOSTING_DIR}/module_win32.cpp"
+    )
+
+    if(NOT EXISTS "${VST3_PLUGPROVIDER}")
+        message(FATAL_ERROR
+            "Missing VST3 source: ${VST3_PLUGPROVIDER}"
+        )
+    endif()
+
+    if(NOT EXISTS "${VST3_WIN_MODULE}")
+        message(FATAL_ERROR
+            "Missing VST3 source: ${VST3_WIN_MODULE}"
+        )
+    endif()
+
+    list(APPEND EASYMIX_SOURCES
+        "${VST3_PLUGPROVIDER}"
+        "${VST3_WIN_MODULE}"
     )
 endif()
 
