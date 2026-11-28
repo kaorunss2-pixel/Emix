@@ -310,10 +310,13 @@ struct Toasts
         if (text.empty()) return;
         int kind = 0;
         if (Has(text, "fail") || Has(text, "Could not") || Has(text, "Invalid") || Has(text, "No ") ||
-            Has(text, "Select a") || Has(text, "not available") || Has(text, "Unsupported"))
+            Has(text, "Select a") || Has(text, "not available") || Has(text, "Unsupported") ||
+            Has(text, "missing") || Has(text, "Relink") || Has(text, "Stop recording") ||
+            Has(text, "truncated") || Has(text, "exceeds") || Has(text, "damaged") ||
+            Has(text, "invalid") || Has(text, "does not contain"))
             kind = 2;
         else if (Has(text, "success") || Has(text, "saved") || Has(text, "exported") ||
-            Has(text, "loaded") || Has(text, "imported") || Has(text, "Stems"))
+            Has(text, "loaded") || Has(text, "imported") || Has(text, "Stems") || Has(text, "relinked"))
             kind = 1;
         items.push_back({ text, ImGui::GetTime(), kind });
         if (items.size() > 6) items.erase(items.begin());
@@ -333,7 +336,8 @@ struct Toasts
             const Item& it = items[i];
             const double age = now - it.born;
             const float a = static_cast<float>(std::clamp(std::min(age / 0.2, (4.0 - age) / 0.6), 0.0, 1.0));
-            const ImVec2 ts = ImGui::CalcTextSize(it.text.c_str());
+            const float textWidth = std::max(120.0f, std::min(460.0f, vp->WorkSize.x - 64.0f));
+            const ImVec2 ts = ImGui::CalcTextSize(it.text.c_str(), nullptr, false, textWidth);
             const ImVec2 sz(ts.x + 28.0f, ts.y + 18.0f);
             const ImVec2 mn(vp->WorkPos.x + vp->WorkSize.x - sz.x - 16.0f, y - sz.y);
             const ImVec2 mx(mn.x + sz.x, mn.y + sz.y);
@@ -342,7 +346,9 @@ struct Toasts
             auto A = [&](ImU32 c) { return (c & 0x00FFFFFF) | (static_cast<ImU32>(((c >> 24) & 0xFF) * a) << 24); };
             dl->AddRectFilled(mn, mx, A(IM_COL32(19, 27, 39, 248)), 9.0f);
             dl->AddRectFilled(mn, ImVec2(mn.x + 4.0f, mx.y), A(acc), 9.0f);
-            dl->AddText(ImVec2(mn.x + 17.0f, mn.y + 9.0f), A(IM_COL32(235, 237, 242, 255)), it.text.c_str());
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                ImVec2(mn.x + 17.0f, mn.y + 9.0f), A(IM_COL32(235, 237, 242, 255)),
+                it.text.c_str(), nullptr, textWidth);
             y -= sz.y + 8.0f;
         }
     }
@@ -455,7 +461,9 @@ inline void DrawShortcutsWindow(bool* open)
         static const Row rows[] = {
             { "Space", "Play / Stop" }, { "Home", "Go to start" }, { "L", "Loop on/off" },
             { "C", "Click (metronome)" }, { "M", "Add marker" }, { "PageUp / PageDown", "Prev / next marker" },
-            { "Ctrl+S", "Save project" }, { "Ctrl+Z / Ctrl+Y", "Undo / Redo" },
+            { "Ctrl+S / Ctrl+Shift+S", "Save / Save As" }, { "Ctrl+N / Ctrl+O", "New / Open project" },
+            { "Ctrl+I", "Import audio" }, { "Ctrl+E / Ctrl+Shift+E", "Export WAV / stems" },
+            { "Ctrl+Z / Ctrl+Y", "Undo / Redo" },
             { "Ctrl+P", "Command palette" }, { "F1", "This window" },
             { "Ctrl+Wheel", "Zoom timeline / piano roll" }, { "S", "Split selected clip at playhead" },
             { "Ctrl+D", "Duplicate clip / notes" }, { "Del", "Delete clip / notes" },
@@ -464,7 +472,6 @@ inline void DrawShortcutsWindow(bool* open)
             { "Double click fader/pan", "Reset to default" },
             { "EQ graph: drag", "Move band (freq / gain)" }, { "EQ graph: wheel", "Change Q" },
             { "Ctrl+C / Ctrl+V", "Copy / paste selected clip (at playhead)" },
-            { "Ctrl+O / Ctrl+E", "Open project / Export WAV" },
             { "Ctrl + = / Ctrl + -", "Zoom timeline in / out" },
             { "End", "Go to end of content" }, { ", / .", "Nudge playhead 1 beat (Shift: 1 bar)" },
             { "I / O", "Set loop start / end at playhead" },

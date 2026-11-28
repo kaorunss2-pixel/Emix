@@ -1,4 +1,5 @@
 #pragma once
+#define EASYMIX_PRO_API 1
 // EasyMix Studio: Pro pack (MIDI input / MIDI recording / loudness normalize / auto take path)
 #ifndef NOMINMAX
 #define NOMINMAX

@@ -1,5 +1,6 @@
 #pragma once
-// EasyMix Studio: Extras (追加機能パック)
+#define EASYMIX_EXTRAS_API 1
+// EasyMix Studio: audio editing, loudness and MIDI generation utilities.
 //  - LUFS meter (momentary / integrated / max) + stereo correlation meter
 //  - Clip edit ops: reverse / mono / remove silence / pitch (resample) -> saved as new WAV (project-safe)
 //  - MIDI generators: random melody (in scale), chord progression (+bass, 7th), drum step sequencer, fill-in
@@ -34,8 +35,9 @@ namespace extras
         double accum = 0.0;
         unsigned count = 0;
         double blocks[4] = {};
-        int bi = 0, filled = 0, sinceInt = 0;
-        std::vector<float> history;
+        int bi = 0, filled = 0;
+        std::vector<float> history = std::vector<float>(36000);
+        size_t historyCount = 0, historyWrite = 0;
         std::atomic<float> momentary{ -70.0f };
         std::atomic<float> integrated{ -70.0f };
         std::atomic<float> maxMomentary{ -70.0f };
@@ -45,9 +47,9 @@ namespace extras
         void reset()
         {
             shelfL.reset(); shelfR.reset(); hpL.reset(); hpR.reset();
-            accum = 0.0; count = 0; bi = 0; filled = 0; sinceInt = 0;
+            accum = 0.0; count = 0; bi = 0; filled = 0;
             for (double& b : blocks) b = 0.0;
-            history.clear();
+            historyCount = historyWrite = 0;
             momentary.store(-70.0f); integrated.store(-70.0f); maxMomentary.store(-70.0f);
         }
 
@@ -84,8 +86,9 @@ namespace extras
         {
             blocks[bi] = e; bi = (bi + 1) & 3;
             if (filled < 4) ++filled;
-            history.push_back(static_cast<float>(e));
-            if (history.size() > 36000) history.erase(history.begin(), history.begin() + 6000);
+            history[historyWrite] = static_cast<float>(e);
+            historyWrite = (historyWrite + 1) % history.size();
+            historyCount = std::min(historyCount + 1, history.size());
 
             if (filled == 4)
             {
@@ -93,17 +96,19 @@ namespace extras
                 momentary.store(l);
                 if (l > maxMomentary.load()) maxMomentary.store(l);
             }
-            if (++sinceInt >= 10) { sinceInt = 0; computeIntegrated(); }
         }
 
         void computeIntegrated()
         {
+            const double absoluteGate = std::pow(10.0, (-70.0 + 0.691) / 10.0);
             double sum = 0.0; size_t n = 0;
-            for (float e : history) if (ToLufs(e) > -70.0f) { sum += e; ++n; }
+            for (size_t i = 0; i < historyCount; ++i)
+                if (history[i] > absoluteGate) { sum += history[i]; ++n; }
             if (!n) { integrated.store(-70.0f); return; }
-            const float gate = ToLufs(sum / n) - 10.0f;
+            const double gate = std::max(absoluteGate, sum / n * 0.1);
             double sum2 = 0.0; size_t n2 = 0;
-            for (float e : history) if (ToLufs(e) > gate) { sum2 += e; ++n2; }
+            for (size_t i = 0; i < historyCount; ++i)
+                if (history[i] > gate) { sum2 += history[i]; ++n2; }
             integrated.store(n2 ? ToLufs(sum2 / n2) : -70.0f);
         }
     };

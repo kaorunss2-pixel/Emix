@@ -1,10 +1,21 @@
 #pragma once
+#define EASYMIX_VST3_OPTIONAL_API 1
 
-#ifdef _WIN32
+#ifndef EASYMIX_ENABLE_VST3
+#define EASYMIX_ENABLE_VST3 0
+#endif
+
+#if EASYMIX_ENABLE_VST3
+inline constexpr bool EasyMixVst3Available = true;
+#if defined(_MSC_VER)
+#pragma message("EasyMix Studio: VST3 ENABLED (matching SDK libraries required)")
+#endif
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
+#ifdef _WIN32
 #include <Windows.h>
 #else
 #include "Platform.h"   // macOS: HWND = void* (NSWindow handle), editor window helpers
@@ -1917,3 +1928,47 @@ private:
 #else
 #endif
 };
+
+#else
+
+#include <string>
+#include <vector>
+
+inline constexpr bool EasyMixVst3Available = false;
+#if defined(_MSC_VER)
+#pragma message("EasyMix Studio: VST3 DISABLED (built-in instruments only; no SDK libraries)")
+#endif
+
+struct VstNote
+{
+    int pitch = 60;
+    double startSec = 0.0;
+    double endSec = 0.0;
+    float velocity = 0.8f;
+};
+
+inline std::vector<std::string> ScanVst3Folders() { return {}; }
+
+// Built-in instruments remain available for projects without VST3 plugins.
+class Vst3Plugin
+{
+public:
+    std::string name;
+    std::string path;
+    std::string lastError = "VST3 is disabled in this build.";
+    bool instrument = false;
+
+    bool load(const std::string&, double, int) { return false; }
+    bool isLoaded() const { return false; }
+    void resetState() {}
+    void beginRealtimeBlock() {}
+    bool queueNoteOn(int, float, int = 0) { return false; }
+    bool queueNoteOff(int, int = 0) { return false; }
+    bool processRealtimeInstrument(float*, int, double, long long) { return false; }
+    bool processRealtimeEffect(float*, int, double, long long, bool = true) { return false; }
+    bool openEditor(void*) { return false; }
+    std::vector<unsigned char> saveState() { return {}; }
+    bool loadState(const std::vector<unsigned char>&) { return false; }
+};
+
+#endif

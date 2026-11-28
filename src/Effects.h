@@ -667,16 +667,16 @@ inline void ProcessEffectNode(
         float baseMs, depthMs, rate, feedback = 0.0f, mix;
         if (node.type == EffectType::Chorus)
         {
-            baseMs = 18.0f; depthMs = 3.0f + amount * 5.0f; rate = 0.5 + amount * 1.5; mix = wet * 0.5f;
+            baseMs = 18.0f; depthMs = 3.0f + amount * 5.0f; rate = 0.5f + amount * 1.5f; mix = wet * 0.5f;
         }
         else if (node.type == EffectType::Flanger)
         {
-            baseMs = 2.5f; depthMs = 1.0f + amount * 3.0f; rate = 0.2 + amount * 0.6; mix = wet * 0.5f;
+            baseMs = 2.5f; depthMs = 1.0f + amount * 3.0f; rate = 0.2f + amount * 0.6f; mix = wet * 0.5f;
             feedback = fb;
         }
         else
         {
-            baseMs = 6.0f; depthMs = 0.5f + amount * 4.0f; rate = 5.0; mix = wet;
+            baseMs = 6.0f; depthMs = 0.5f + amount * 4.0f; rate = 5.0f; mix = wet;
         }
 
         size_t w = node.delayPosition;

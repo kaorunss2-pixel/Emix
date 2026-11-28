@@ -155,8 +155,8 @@ if(APPLE)
 endif()
 
 if(APPLE)
-    set(EASYMIX_VERSION "1.1" CACHE STRING "Bundle short version (CFBundleShortVersionString)")
-    set(EASYMIX_BUILD "2" CACHE STRING "Bundle build number (CFBundleVersion)")
+    set(EASYMIX_VERSION "1.2" CACHE STRING "Bundle short version (CFBundleShortVersionString)")
+    set(EASYMIX_BUILD "3" CACHE STRING "Bundle build number (CFBundleVersion)")
 
     add_executable(EasyMix MACOSX_BUNDLE
         ${EASYMIX_SOURCES}
@@ -184,6 +184,9 @@ target_include_directories(EasyMix PRIVATE
 
 target_compile_definitions(EasyMix PRIVATE
     EASYMIX_CMAKE
+    # Vst3Host.h is optional-API: enable the real VST3 host (CMake links the SDK).
+    EASYMIX_ENABLE_VST3=1
+    EASYMIX_VST3_LINKED
 )
 
 target_link_libraries(EasyMix PRIVATE
