@@ -4,12 +4,15 @@
 //  - MessageBoxA                                          -> NSAlert
 //  - glfwGetWin32Window                                   -> NSWindow of the GLFW window
 //  - strcpy_s                                             -> bounded copy
+//  - MoveFileExA (MOVEFILE_REPLACE_EXISTING)              -> std::filesystem::rename
 // C++ only (do not include from .mm files; they use PlatformApi.h).
 #include "PlatformApi.h"
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 
 #ifndef __APPLE__
 #error "Platform.h is for macOS only."
@@ -118,4 +121,23 @@ inline int strcpy_s(char* dst, size_t cap, const char* src)
         return 1;
     std::snprintf(dst, cap, "%s", src ? src : "");
     return 0;
+}
+
+// MoveFileExA with MOVEFILE_REPLACE_EXISTING: std::filesystem::rename replaces an
+// existing target on macOS (rename(2)) and Windows alike, so it matches the
+// atomic temp-file -> final-file pattern used for WAV/project saves.
+#ifndef MOVEFILE_REPLACE_EXISTING
+#define MOVEFILE_REPLACE_EXISTING 0x00000001
+#endif
+#ifndef MOVEFILE_WRITE_THROUGH
+#define MOVEFILE_WRITE_THROUGH 0x00000008
+#endif
+
+inline BOOL MoveFileExA(const char* from, const char* to, DWORD /*flags*/)
+{
+    if (!from || !to)
+        return FALSE;
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    return ec ? FALSE : TRUE;
 }
