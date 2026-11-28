@@ -29,6 +29,9 @@
 
 #include "PianoRoll.h"   // MidiNote / DrawPianoRoll / RenderMidiBuiltin
 #include "Vst3Host.h"    // Vst3Plugin / ScanVst3Folders / VstNote
+#ifndef EASYMIX_VST3_OPTIONAL_API
+#error "Use Vst3Host.h from the same EasyMix Studio source bundle."
+#endif
 #include <cctype>
 #include "Effects.h"     // built-in effects (streaming)
 #include "BuiltinSynth.h" // built-in instruments (113 presets, GM drum kits)
@@ -38,7 +41,14 @@
 #include "EasyMixUi.h"   // EQ graph / spectrum / meters / toasts / command palette
 #include "OtoMad.h"
 #include "EasyMixPro.h"   // MIDI input / MIDI rec / loudness normalize
+#if !defined(EASYMIX_PRO_API) && defined(_MSC_VER)
+#pragma message("EasyMix: old EasyMixPro.h in use; replace it if pro:: types are missing")
+#endif
 #include "EasyMixExtras.h" // MIDI generators / clip processing / loudness utilities
+#if !defined(EASYMIX_EXTRAS_API) && defined(_MSC_VER)
+#pragma message("EasyMix: old EasyMixExtras.h in use; replace it if extras:: types are missing")
+#endif
+#include "StudioCore.h"
 
 #include <vector>
 #include <string>
@@ -49,6 +59,10 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
+#include <system_error>
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 #include <cmath>
@@ -59,20 +73,17 @@
 #include <cstdint>
 #include <unordered_map>
 #if defined(_WIN32) && !defined(EASYMIX_CMAKE)
-// Visual Studio / vcpkg build (CMake links these libraries itself)
 #pragma comment(lib, "opengl32.lib")
 #pragma comment(lib, "comdlg32.lib")
-#ifdef _DEBUG
-#define VST3_LIB_DIR "C:/vcpkg/installed/x64-windows/debug/lib/vst3sdk/"
-#else
-#define VST3_LIB_DIR "C:/vcpkg/installed/x64-windows/lib/vst3sdk/"
-#endif
-#pragma comment(lib, VST3_LIB_DIR "sdk_hosting.lib")
-#pragma comment(lib, VST3_LIB_DIR "sdk_common.lib")
-#pragma comment(lib, VST3_LIB_DIR "sdk.lib")
-#pragma comment(lib, VST3_LIB_DIR "base.lib")
-#pragma comment(lib, VST3_LIB_DIR "pluginterfaces.lib")
 #pragma comment(lib, "ole32.lib")
+#endif
+#if defined(_MSC_VER) && EASYMIX_ENABLE_VST3 && !defined(EASYMIX_VST3_LINKED)
+// For the original Visual Studio project. Use libraries built from the same SDK as the headers.
+#pragma comment(lib, "sdk_hosting.lib")
+#pragma comment(lib, "sdk_common.lib")
+#pragma comment(lib, "sdk.lib")
+#pragma comment(lib, "base.lib")
+#pragma comment(lib, "pluginterfaces.lib")
 #endif
 
 #ifdef __APPLE__
@@ -201,7 +212,7 @@ struct AutomationPoint
     float time = 0.0f;
     float value = 1.0f;
 };
-struct TimelineMarker
+struct Marker
 {
     float beat = 0.0f;
     std::string name;
@@ -231,8 +242,15 @@ static bool BusIsReverb(int index) { return index >= 0 && index < 4; }
 
 struct RecordingState
 {
-    ma_encoder encoder;
+    ma_encoder encoder = {};
     std::atomic<bool> active{ false };
+    std::atomic<bool> writerRunning{ false };
+    std::unique_ptr<studio::RecordRing> ring;
+    std::atomic<ma_uint64> dropped{ 0 };
+    std::atomic<bool> ioError{ false };
+    std::mutex wakeMutex;
+    std::condition_variable wake;
+    std::thread writer;
 };
 
 struct RTContext
@@ -254,7 +272,7 @@ struct ProjectSnapshot
     std::vector<std::vector<std::shared_ptr<Vst3Plugin>>> vst;
     std::vector<AudioClip> clips;
     std::vector<MidiNote> notes;
-    std::vector<TimelineMarker> markers;
+    std::vector<Marker> markers;
     std::vector<float> sends;
     std::vector<synth::Setup> synths;
     BusSettings bus;
@@ -342,17 +360,13 @@ void recordingCallback(
     auto* state =
         static_cast<RecordingState*>(device->pUserData);
 
-    if (!input || !state->active.load())
+    if (!input || !state->active.load(std::memory_order_acquire))
         return;
 
-    ma_uint64 framesWritten = 0;
-
-    ma_encoder_write_pcm_frames(
-        &state->encoder,
-        input,
-        frameCount,
-        &framesWritten
-    );
+    const size_t written = state->ring->write(static_cast<const float*>(input), frameCount);
+    if (written < frameCount)
+        state->dropped.fetch_add(frameCount - written, std::memory_order_relaxed);
+    state->wake.notify_one();
 }
 
 void realtimeAudioCallback(
@@ -386,7 +400,7 @@ int main()
     float playheadPosition = 0.0f;
 
     int timelineBars = 16;
-    int selectedTrack = -1;
+    int selectedTrack = 0;
 
     int draggingClipIndex = -1;
     float dragOffsetPixels = 0.0f;
@@ -413,10 +427,11 @@ int main()
     float dragOrigDuration = 0.0f;
     float dragOrigOffset = 0.0f;
     bool projectDirty = false;
-    bool lastTitleDirty = false;
+    std::string lastWindowTitle;
     bool resetLayoutFlag = false;
 
     char renameBuffer[128] = {};
+    char trackFilter[96] = {};
 
     std::vector<std::string> tracks = {
         "Vocal",
@@ -430,15 +445,11 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-#ifdef __APPLE__
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);   // required on macOS
-    glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, GLFW_TRUE);
-#endif
 
     GLFWwindow* window = glfwCreateWindow(
-        1280,
-        720,
-        "EasyMix Studio 1.1 | Vocal Workstation",
+        1440,
+        900,
+        "EasyMix Studio | Project",
         nullptr,
         nullptr
     );
@@ -451,6 +462,7 @@ int main()
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
+    glfwSetWindowSizeLimits(window, 900, 620, GLFW_DONT_CARE, GLFW_DONT_CARE);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -458,15 +470,20 @@ int main()
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
-#ifdef __APPLE__
-    // keep the layout file in ~/Library/Application Support/EasyMix (cwd is not writable in an .app)
-    static std::string imguiIniPath = plat::SupportDir().empty()
-        ? std::string("imgui.ini")
-        : plat::SupportDir() + "/imgui.ini";
-    io.IniFilename = imguiIniPath.c_str();
-#endif
-
-    ApplyCubaseStyle();
+    ApplyEasyMixStyle();
+    float dpiX = 1.0f, dpiY = 1.0f;
+    glfwGetWindowContentScale(window, &dpiX, &dpiY);
+    const float dpiScale = std::clamp(dpiX, 1.0f, 2.0f);
+    const float fontSize = 15.0f * dpiScale;
+    if (io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf",
+        fontSize, nullptr, io.Fonts->GetGlyphRangesDefault()))
+    {
+        io.FontGlobalScale = 1.0f / dpiScale;
+        ImFontConfig japanese{};
+        japanese.MergeMode = true;
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\meiryo.ttc", fontSize,
+            &japanese, io.Fonts->GetGlyphRangesJapanese());
+    }
 
     if (!ImGui_ImplGlfw_InitForOpenGL(window, true))
     {
@@ -501,17 +518,17 @@ int main()
     std::string currentProjectPath;
     int contextClipIndex = -1;
     bool showMixer = true;
-    bool showAutomation = true;
+    bool showAutomation = false;
     std::vector<std::unique_ptr<AudioClip>> audioClips;
     std::vector<MidiNote> midiNotes;
-    std::vector<TimelineMarker> markers;
-    bool showMarkers = true;
+    std::vector<Marker> markers;
+    bool showMarkers = false;
     bool showBus = false;
 
     PianoRollState pianoRoll;
     std::vector<std::vector<std::shared_ptr<Vst3Plugin>>> trackVst(tracks.size());
     std::vector<std::string> vst3Found;
-    bool showVstRack = true;
+    bool showVstRack = false;
     int pianoRollVstSelection = 0;
     bool showPianoRoll = false;
     bool showExtrasGenerator = false;
@@ -528,6 +545,7 @@ int main()
     std::string lastUstxPath;
     std::string openUtauRealtimePluginPath;
     bool showInspector = true;
+    bool showMediaPool = false;
     bool snapEnabled = true;
 
     float snapBeat = 0.25f;
@@ -597,12 +615,15 @@ int main()
     std::vector<float> trackSends(tracks.size(), 0.0f);
     pro::MidiIn midiIn;
     pro::LiveState live;
+    std::unordered_map<int, int> midiHeldTrack;
     extras::LufsMeter lufs;
     extras::CorrelationMeter corr;
     bool exportNormalize = false;
+    bool exportLoopOnly = false;
     float exportTargetLufs = -14.0f;
+    RecordingState recordingState;
     int audioBuffer = 512;
-    bool showMidiIn = true, showLoudness = true;
+    bool showMidiIn = false, showLoudness = false;
     BusSettings bus;
     EffectNode busFx;
     int busAppliedIndex = -1;
@@ -739,17 +760,23 @@ int main()
             if (wasLocked) uiLock.lock();
             return r;
         };
+    auto loadPcmWithoutBlockingAudio = [&](const std::string& path)
+        {
+            const bool wasLocked = uiLock.owns_lock();
+            if (wasLocked) uiLock.unlock();
+            auto pcm = LoadPcm(path);
+            if (wasLocked) uiLock.lock();
+            return pcm;
+        };
 
-    struct ActiveNote { int pitch; long long endFrame; };
     struct TrackRT
     {
-        std::vector<ActiveNote> active;
+        std::vector<studio::ActiveMidiNote> active;
         synth::Engine eng;
     };
-    struct MidiEv { int offset; bool on; int pitch; float vel; };
 
     std::vector<TrackRT> trackRT;
-    std::vector<MidiEv> evScratch;
+    std::vector<studio::MidiEvent> evScratch;
     evScratch.reserve(1024);
     std::vector<std::vector<float>> trackBuf;
     std::vector<float> instBuf(static_cast<size_t>(kBlock) * 2, 0.0f);
@@ -839,6 +866,8 @@ int main()
             stopAllClips();
             clearMidiPlayback();
             playing = false;
+            live.held.clear();
+            midiHeldTrack.clear();
             audioClips.clear();
             midiNotes.clear();
             trackVst.clear();
@@ -847,6 +876,18 @@ int main()
             markers.clear();
             currentProjectPath.clear();
             playheadPosition = 0.0f;
+            bpm = 120.0f;
+            timelineZoom = 80.0f;
+            prevBpm = bpm;
+            prevTimelineZoom = timelineZoom;
+            timelineBars = 16;
+            masterVolume = 1.0f;
+            loopEnabled = false;
+            loopStartBeat = 0.0f;
+            loopEndBeat = 16.0f;
+            metronomeOn = false;
+            masterLimiterOn = true;
+            masterLimiter.amount = 0.0f;
             tracks = { "Vocal", "Drums", "Bass" };
             trackVolumes.assign(3, 1.0f);
             trackPans.assign(3, 0.0f);
@@ -867,6 +908,7 @@ int main()
             contextClipIndex = -1;
             draggingClipIndex = -1;
             draggingAudioClip = false;
+            trackFilter[0] = 0;
         };
 
     auto projectHash = [&]() -> std::uint64_t
@@ -959,6 +1001,7 @@ int main()
             for (const auto& c : audioClips)
             {
                 mix(c->name.data(), c->name.size());
+                mix(c->path.data(), c->path.size());
                 mf(c->startSeconds);
                 mf(c->duration);
                 mi(c->trackIndex);
@@ -1162,6 +1205,11 @@ int main()
                     t >= static_cast<int>(effectGraphs.size()) ||
                     t >= static_cast<int>(trackVst.size()))
                     continue;
+                if (exporting && (trackMuted[t] || (hasSolo && !trackSolo[t])))
+                {
+                    trackPeak[t] = 0.0f;
+                    continue;
+                }
 
                 std::vector<float>& tb = trackBuf[t];
                 if (tb.size() < static_cast<size_t>(kBlock) * 2)
@@ -1209,43 +1257,7 @@ int main()
                 }
 
                 TrackRT& rtT = trackRT[t];
-                evScratch.clear();
-
-                for (const auto& note : midiNotes)
-                {
-                    if (note.trackIndex != t)
-                        continue;
-
-                    const long long sf = static_cast<long long>(note.startBeat * framesPerBeat);
-                    if (sf < start || sf >= end)
-                        continue;
-
-                    long long ef = static_cast<long long>((note.startBeat + note.lengthBeats) * framesPerBeat);
-                    if (ef <= sf) ef = sf + 1;
-
-                    evScratch.push_back({ static_cast<int>(sf - start), true, note.pitch, note.velocity });
-                    rtT.active.push_back({ note.pitch, ef });
-                }
-
-                for (size_t k = 0; k < rtT.active.size();)
-                {
-                    if (rtT.active[k].endFrame < end)
-                    {
-                        evScratch.push_back({
-                            static_cast<int>(std::max<long long>(0, rtT.active[k].endFrame - start)),
-                            false, rtT.active[k].pitch, 0.0f });
-                        rtT.active.erase(rtT.active.begin() + k);
-                    }
-                    else
-                        ++k;
-                }
-
-                std::stable_sort(evScratch.begin(), evScratch.end(),
-                    [](const MidiEv& a, const MidiEv& b)
-                    {
-                        if (a.offset != b.offset) return a.offset < b.offset;
-                        return !a.on && b.on;
-                    });
+                studio::ScheduleMidiBlock(midiNotes, t, start, n, framesPerBeat, rtT.active, evScratch);
 
                 std::shared_ptr<Vst3Plugin> inst;
                 for (auto& v : trackVst[t])
@@ -1257,9 +1269,9 @@ int main()
                     for (const auto& e : evScratch)
                     {
                         if (e.on)
-                            inst->queueNoteOn(e.pitch, e.vel, e.offset);
+                            inst->queueNoteOn(e.pitch, e.velocity, e.offset);
                         else if (!inst->queueNoteOff(e.pitch, e.offset))
-                            rtT.active.push_back({ e.pitch, end });
+                            rtT.active.push_back({ e.id, e.pitch, end });
                     }
 
                     std::fill(instBuf.begin(), instBuf.begin() + static_cast<size_t>(n) * 2, 0.0f);
@@ -1280,7 +1292,7 @@ int main()
                             rtT.eng.Render(tb.data() + static_cast<size_t>(pos) * 2, off - pos);
                             pos = off;
                         }
-                        if (e.on) rtT.eng.NoteOn(su, e.pitch, e.vel);
+                        if (e.on) rtT.eng.NoteOn(su, e.pitch, e.velocity);
                         else rtT.eng.NoteOff(e.pitch);
                     }
                     if (pos < n)
@@ -1519,187 +1531,229 @@ int main()
 
             audioError.clear();
             playFrame = frameFromPlayhead();
+            if (loopEnabled && loopEndBeat > loopStartBeat + 0.24f)
+            {
+                const double framesPerBeat = 60.0 / bpm * kEngineRate;
+                if (playFrame >= static_cast<long long>(std::llround(loopEndBeat * framesPerBeat)))
+                    playFrame = static_cast<long long>(std::llround(loopStartBeat * framesPerBeat));
+            }
             clearMidiPlayback();
             playing = true;
+        };
+
+    auto addAudioFile = [&](const std::string& path, float atSeconds) -> bool
+        {
+            if (tracks.empty()) { audioError = "Add a track before importing audio."; return false; }
+            auto clip = std::make_unique<AudioClip>();
+            clip->path = path;
+            clip->name = std::filesystem::path(path).filename().string();
+            clip->pcm = loadPcmWithoutBlockingAudio(path);
+            if (!clip->pcm) { audioError = "Audio loading failed: " + clip->name; return false; }
+            clip->sampleRate = kEngineRate;
+            clip->duration = static_cast<float>(clip->pcm->size() / 2) / kEngineRate;
+            clip->startSeconds = std::max(0.0f, atSeconds);
+            clip->trackIndex = selectedTrack >= 0 && selectedTrack < static_cast<int>(tracks.size())
+                ? selectedTrack : 0;
+            buildWaveform(*clip);
+            audioClips.push_back(std::move(clip));
+            audioError = "Audio imported: " + audioClips.back()->name;
+            return true;
         };
 
     auto importWav = [&]()
         {
             char filePath[MAX_PATH] = {};
-
             OPENFILENAMEA dialog = {};
             dialog.lStructSize = sizeof(dialog);
             dialog.hwndOwner = glfwGetWin32Window(window);
             dialog.lpstrFile = filePath;
             dialog.nMaxFile = MAX_PATH;
-            dialog.lpstrFilter =
-                "Audio Files\0*.wav;*.mp3\0"
-                "WAV Files\0*.wav\0"
-                "MP3 Files\0*.mp3\0"
-                "All Files\0*.*\0";
+            dialog.lpstrFilter = "Audio Files\0*.wav;*.mp3;*.flac\0All Files\0*.*\0";
             dialog.nFilterIndex = 1;
-            dialog.Flags =
-                OFN_FILEMUSTEXIST |
-                OFN_PATHMUSTEXIST;
+            dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            if (DialogOpen(&dialog))
+                addAudioFile(filePath, playheadPosition * 240.0f / (timelineZoom * bpm));
+        };
 
-            if (!DialogOpen(&dialog))
-                return;
+    std::vector<std::string> droppedAudioPaths;
+    glfwSetWindowUserPointer(window, &droppedAudioPaths);
+    glfwSetDropCallback(window, [](GLFWwindow* w, int count, const char** paths)
+        {
+            auto* pending = static_cast<std::vector<std::string>*>(glfwGetWindowUserPointer(w));
+            for (int i = 0; i < count; ++i) pending->emplace_back(paths[i]);
+        });
 
-            auto clip = std::make_unique<AudioClip>();
-
-            clip->path = filePath;
-
-            std::filesystem::path path(filePath);
-            clip->name = path.filename().string();
-
-            clip->pcm = LoadPcm(clip->path);
-            if (!clip->pcm)
+    // Render twice only when normalizing; never allocate memory proportional to song length.
+    auto writeOfflineWav = [&](const std::string& path, long long startFrame,
+        long long endFrame, bool loopRange, bool normalize, float& gainDb) -> bool
+        {
+            const ma_format formats[] = { ma_format_s16, ma_format_s24, ma_format_f32 };
+            const ma_format format = formats[std::clamp(exportBits, 0, 2)];
+            const long long total = endFrame - startFrame +
+                (loopRange ? 0 : static_cast<long long>(2.5 * kEngineRate));
+            const unsigned bytesPerFrame = 2 * ma_get_bytes_per_sample(format);
+            if (total <= 0 || static_cast<unsigned long long>(total) >
+                (0xFFFFFFFFULL - 64) / bytesPerFrame)
             {
-                audioError = "Audio loading failed: " + clip->name;
-                return;
+                audioError = "WAV exceeds 4 GB. Export a loop range or choose a lower bit depth.";
+                return false;
             }
 
-            clip->sampleRate = kEngineRate;
-            clip->duration =
-                static_cast<float>(clip->pcm->size() / 2) /
-                static_cast<float>(kEngineRate);
+            const long long previousEnd = contentEndFrame;
+            contentEndFrame = endFrame;
+            exporting = true;
+            auto resetRender = [&]()
+                {
+                    flushPlugins();
+                    ResetEffectNodeState(masterLimiter);
+                    ResetEffectNodeState(busFx);
+                    busAppliedIndex = -1;
+                };
+            auto finish = [&]()
+                {
+                    exporting = false;
+                    contentEndFrame = previousEnd;
+                    resetRender();
+                };
+            std::vector<float> block(static_cast<size_t>(kBlock) * 2);
+            resetRender();
+            gainDb = 0.0f;
 
-            clip->startSeconds =
-                playheadPosition * 240.0f /
-                (timelineZoom * bpm);
+            if (normalize)
+            {
+                extras::LufsMeter meter;
+                meter.setup(kEngineRate);
+                float peak = 0.0f;
+                for (long long pos = 0; pos < total; pos += kBlock)
+                {
+                    const int n = static_cast<int>(std::min<long long>(kBlock, total - pos));
+                    renderChunk(startFrame + pos, n, block.data());
+                    meter.process(block.data(), static_cast<unsigned>(n));
+                    for (int i = 0; i < n * 2; ++i)
+                        peak = std::max(peak, std::fabs(block[i]));
+                }
+                meter.computeIntegrated();
+                gainDb = studio::NormalizationGainDb(meter.integrated.load(),
+                    peak, exportTargetLufs, -1.0f);
+                resetRender();
+            }
 
-            clip->trackIndex =
-                selectedTrack >= 0 && selectedTrack < static_cast<int>(tracks.size())
-                ? selectedTrack : 0;
+            const std::string temporary = path + ".partial.wav";
+            ma_encoder encoder{};
+            const ma_encoder_config config = ma_encoder_config_init(
+                ma_encoding_format_wav, format, 2, kEngineRate);
+            if (ma_encoder_init_file(temporary.c_str(), &config, &encoder) != MA_SUCCESS)
+            {
+                finish();
+                std::error_code ec;
+                std::filesystem::remove(temporary, ec);
+                audioError = "Could not open the WAV export file.";
+                return false;
+            }
 
-            buildWaveform(*clip);
-            audioClips.push_back(std::move(clip));
+            std::vector<unsigned char> converted;
+            if (format != ma_format_f32)
+                converted.resize(static_cast<size_t>(kBlock) * bytesPerFrame);
+            const float gain = std::pow(10.0f, gainDb / 20.0f);
+            bool ok = true;
+            for (long long pos = 0; pos < total && ok; pos += kBlock)
+            {
+                const int n = static_cast<int>(std::min<long long>(kBlock, total - pos));
+                renderChunk(startFrame + pos, n, block.data());
+                for (int i = 0; i < n * 2; ++i)
+                    block[i] = std::clamp(std::isfinite(block[i]) ? block[i] * gain : 0.0f, -1.0f, 1.0f);
 
-            audioError.clear();
+                const void* data = block.data();
+                if (format != ma_format_f32)
+                {
+                    ma_convert_pcm_frames_format(converted.data(), format, block.data(), ma_format_f32,
+                        static_cast<ma_uint64>(n), 2,
+                        format == ma_format_s16 ? ma_dither_mode_triangle : ma_dither_mode_none);
+                    data = converted.data();
+                }
+                ma_uint64 written = 0;
+                ok = ma_encoder_write_pcm_frames(&encoder, data, static_cast<ma_uint64>(n), &written)
+                    == MA_SUCCESS && written == static_cast<ma_uint64>(n);
+            }
+            ma_encoder_uninit(&encoder);
+            finish();
+
+            if (ok)
+                ok = MoveFileExA(temporary.c_str(), path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+            if (!ok)
+            {
+                std::error_code ec;
+                std::filesystem::remove(temporary, ec);
+                audioError = "WAV export failed; the previous file was kept.";
+            }
+            return ok;
+        };
+
+    auto exportFrameRange = [&](long long contentEnd, long long& first, long long& last) -> bool
+        {
+            first = 0;
+            last = contentEnd;
+            if (!exportLoopOnly) return true;
+            if (!loopEnabled || loopEndBeat <= loopStartBeat)
+            { audioError = "Enable LOOP and set its start/end before exporting a loop range."; return false; }
+            const double framesPerBeat = 60.0 / bpm * kEngineRate;
+            first = static_cast<long long>(std::llround(std::max(0.0f, loopStartBeat) * framesPerBeat));
+            last = static_cast<long long>(std::llround(loopEndBeat * framesPerBeat));
+            if (last <= first || first >= contentEnd)
+            { audioError = "The loop range does not contain project audio."; return false; }
+            return true;
         };
 
     auto exportWav = [&]()
         {
-            char normMsg[96] = "WAV exported successfully!";
+            if (recordingState.active.load())
+            { audioError = "Stop recording before exporting."; return; }
+            if (std::any_of(audioClips.begin(), audioClips.end(),
+                [](const std::unique_ptr<AudioClip>& c) { return !c->pcm; }))
+            { showMediaPool = true; audioError = "Relink missing audio in Media Pool before exporting."; return; }
             const long long contentEnd = computeContentEnd();
-            if (contentEnd <= 0)
-            {
-                audioError = "No audio clips or MIDI notes to export.";
-                return;
-            }
-
+            if (contentEnd <= 0) { audioError = "No audio clips or MIDI notes to export."; return; }
+            long long first = 0, last = 0;
+            if (!exportFrameRange(contentEnd, first, last)) return;
             char filePath[MAX_PATH] = {};
-
             OPENFILENAMEA dialog = {};
             dialog.lStructSize = sizeof(dialog);
             dialog.hwndOwner = glfwGetWin32Window(window);
             dialog.lpstrFile = filePath;
             dialog.nMaxFile = MAX_PATH;
-            dialog.lpstrFilter =
-                "WAV Files\0*.wav\0All Files\0*.*\0";
+            dialog.lpstrFilter = "WAV Files\0*.wav\0All Files\0*.*\0";
             dialog.lpstrDefExt = "wav";
-            dialog.Flags =
-                OFN_OVERWRITEPROMPT |
-                OFN_PATHMUSTEXIST;
-
-            if (!DialogSave(&dialog))
-                return;
+            dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+            if (!DialogSave(&dialog)) return;
 
             stopAllClips();
-
-            const long long totalFrames = contentEnd + static_cast<long long>(2.5 * kEngineRate);
-
-            std::vector<float> mixBuffer(static_cast<size_t>(totalFrames) * 2, 0.0f);
-
-            const long long savedEnd = contentEndFrame;
-            contentEndFrame = contentEnd;
-            exporting = true;
-
-            for (long long pos = 0; pos < totalFrames; pos += kBlock)
+            float gainDb = 0.0f;
+            if (writeOfflineWav(filePath, first, last, exportLoopOnly, exportNormalize, gainDb))
             {
-                const int n = static_cast<int>(std::min<long long>(kBlock, totalFrames - pos));
-                renderChunk(pos, n, mixBuffer.data() + static_cast<size_t>(pos) * 2);
+                char msg[96];
+                if (exportNormalize)
+                    std::snprintf(msg, sizeof(msg), "WAV exported (%+.1f dB, target %.0f LUFS)", gainDb, exportTargetLufs);
+                else std::snprintf(msg, sizeof(msg), "WAV exported successfully.");
+                audioError = msg;
             }
-
-            contentEndFrame = savedEnd;
-            exporting = false;
-            flushPlugins();
-
-            if (exportNormalize)
-            {
-                const float db = pro::NormalizeToLufs(mixBuffer, kEngineRate, exportTargetLufs, -1.0f);
-                std::snprintf(normMsg, sizeof(normMsg), "WAV exported (%+.1f dB -> %.0f LUFS)", db, exportTargetLufs);
-            }
-
-            for (float& sample : mixBuffer)
-                sample = std::clamp(sample, -1.0f, 1.0f);
-
-            const ma_format exportFormats[3] = { ma_format_s16, ma_format_s24, ma_format_f32 };
-            const ma_format exportFormat = exportFormats[std::clamp(exportBits, 0, 2)];
-
-            ma_encoder_config encoderConfig =
-                ma_encoder_config_init(
-                    ma_encoding_format_wav,
-                    exportFormat,
-                    2,
-                    kEngineRate
-                );
-
-            std::vector<unsigned char> convertedMix;
-            const void* exportData = mixBuffer.data();
-            if (exportFormat != ma_format_f32)
-            {
-                convertedMix.resize(static_cast<size_t>(totalFrames) * 2 * ma_get_bytes_per_sample(exportFormat));
-                ma_convert_pcm_frames_format(
-                    convertedMix.data(), exportFormat,
-                    mixBuffer.data(), ma_format_f32,
-                    static_cast<ma_uint64>(totalFrames), 2,
-                    exportFormat == ma_format_s16 ? ma_dither_mode_triangle : ma_dither_mode_none);
-                exportData = convertedMix.data();
-            }
-
-            ma_encoder encoder;
-
-            ma_result result = ma_encoder_init_file(
-                filePath,
-                &encoderConfig,
-                &encoder
-            );
-
-            if (result != MA_SUCCESS)
-            {
-                audioError = "WAV export initialization failed.";
-                return;
-            }
-
-            ma_uint64 framesWritten = 0;
-
-            result = ma_encoder_write_pcm_frames(
-                &encoder,
-                exportData,
-                static_cast<ma_uint64>(totalFrames),
-                &framesWritten
-            );
-
-            ma_encoder_uninit(&encoder);
-
-            if (result != MA_SUCCESS || framesWritten != static_cast<ma_uint64>(totalFrames))
-            {
-                audioError = "WAV export failed.";
-                return;
-            }
-
-            audioError = normMsg;
         };
 
     auto exportStems = [&]()
         {
+            if (recordingState.active.load())
+            { audioError = "Stop recording before exporting."; return; }
+            if (std::any_of(audioClips.begin(), audioClips.end(),
+                [](const std::unique_ptr<AudioClip>& c) { return !c->pcm; }))
+            { showMediaPool = true; audioError = "Relink missing audio in Media Pool before exporting."; return; }
             const long long contentEnd = computeContentEnd();
             if (contentEnd <= 0)
             {
                 audioError = "No audio clips or MIDI notes to export.";
                 return;
             }
+            long long first = 0, last = 0;
+            if (!exportFrameRange(contentEnd, first, last)) return;
 
             char filePath[MAX_PATH] = {};
             OPENFILENAMEA dialog = {};
@@ -1718,13 +1772,10 @@ int main()
             const std::filesystem::path basePath(filePath);
             const std::filesystem::path dir = basePath.parent_path();
             const std::string stem = basePath.stem().string();
-            const long long totalFrames = contentEnd + static_cast<long long>(2.5 * kEngineRate);
 
             const std::vector<bool> savedSolo = trackSolo;
-            const long long savedEnd = contentEndFrame;
-            const ma_format exportFormats[3] = { ma_format_s16, ma_format_s24, ma_format_f32 };
-            const ma_format exportFormat = exportFormats[std::clamp(exportBits, 0, 2)];
-            int written = 0;
+            int written = 0, failed = 0;
+            std::string lastFailure;
 
             for (size_t t = 0; t < tracks.size(); ++t)
             {
@@ -1733,30 +1784,19 @@ int main()
 
                 bool hasContent = false;
                 for (const auto& c : audioClips)
-                    if (c->trackIndex == static_cast<int>(t)) { hasContent = true; break; }
+                    if (c->trackIndex == static_cast<int>(t) &&
+                        (c->startSeconds + c->duration) * kEngineRate > first &&
+                        c->startSeconds * kEngineRate < last) { hasContent = true; break; }
                 if (!hasContent)
                     for (const auto& n : midiNotes)
-                        if (n.trackIndex == static_cast<int>(t)) { hasContent = true; break; }
+                        if (n.trackIndex == static_cast<int>(t) &&
+                            (n.startBeat + n.lengthBeats) * 60.0 / bpm * kEngineRate > first &&
+                            n.startBeat * 60.0 / bpm * kEngineRate < last) { hasContent = true; break; }
                 if (!hasContent)
                     continue;
 
                 for (size_t k = 0; k < trackSolo.size(); ++k)
                     trackSolo[k] = (k == t);
-
-                flushPlugins();
-
-                std::vector<float> mix(static_cast<size_t>(totalFrames) * 2, 0.0f);
-                contentEndFrame = contentEnd;
-                exporting = true;
-                for (long long pos = 0; pos < totalFrames; pos += kBlock)
-                {
-                    const int n = static_cast<int>(std::min<long long>(kBlock, totalFrames - pos));
-                    renderChunk(pos, n, mix.data() + static_cast<size_t>(pos) * 2);
-                }
-                exporting = false;
-
-                for (float& sample : mix)
-                    sample = std::clamp(sample, -1.0f, 1.0f);
 
                 std::string trackName = tracks[t];
                 for (char& ch : trackName)
@@ -1764,46 +1804,29 @@ int main()
 
                 const std::filesystem::path outPath =
                     dir / (stem + "_" + std::to_string(t + 1) + "_" + trackName + ".wav");
-
-                ma_encoder_config encoderConfig =
-                    ma_encoder_config_init(ma_encoding_format_wav, exportFormat, 2, kEngineRate);
-
-                std::vector<unsigned char> converted;
-                const void* data = mix.data();
-                if (exportFormat != ma_format_f32)
-                {
-                    converted.resize(static_cast<size_t>(totalFrames) * 2 * ma_get_bytes_per_sample(exportFormat));
-                    ma_convert_pcm_frames_format(
-                        converted.data(), exportFormat,
-                        mix.data(), ma_format_f32,
-                        static_cast<ma_uint64>(totalFrames), 2,
-                        exportFormat == ma_format_s16 ? ma_dither_mode_triangle : ma_dither_mode_none);
-                    data = converted.data();
-                }
-
-                ma_encoder encoder;
-                if (ma_encoder_init_file(outPath.string().c_str(), &encoderConfig, &encoder) != MA_SUCCESS)
-                    continue;
-
-                ma_uint64 framesWritten = 0;
-                const ma_result r = ma_encoder_write_pcm_frames(
-                    &encoder, data, static_cast<ma_uint64>(totalFrames), &framesWritten);
-                ma_encoder_uninit(&encoder);
-
-                if (r == MA_SUCCESS)
-                    ++written;
+                float unusedGain = 0.0f;
+                // Stems stay at unity gain so they reconstruct the original mix.
+                if (writeOfflineWav(outPath.string(), first, last, exportLoopOnly, false, unusedGain)) ++written;
+                else { ++failed; lastFailure = audioError; }
             }
 
             trackSolo = savedSolo;
-            contentEndFrame = savedEnd;
-            exporting = false;
-            flushPlugins();
-
-            audioError = "Stems exported: " + std::to_string(written) + " files";
+            audioError = failed ? "Stems: " + std::to_string(written) + " saved, " +
+                std::to_string(failed) + " failed. " + lastFailure
+                : "Stems exported: " + std::to_string(written) + " files";
         };
 
     auto saveProject = [&](const std::string& requestedPath = std::string(), bool forceDialog = false)
         {
+            if (recordingState.active.load())
+            { audioError = "Stop recording before saving the project."; return; }
+            for (const auto& clip : audioClips)
+                if (!clip->pcm || !std::filesystem::exists(clip->path))
+                {
+                    audioError = "Missing audio: relink in Media Pool before saving.";
+                    showMediaPool = true;
+                    return;
+                }
             std::string path = (!forceDialog && requestedPath.empty()) ? currentProjectPath : requestedPath;
             if (forceDialog || path.empty())
             {
@@ -1836,7 +1859,11 @@ int main()
             out << audioClips.size() << '\n';
             std::filesystem::path projectPath(path);
             std::filesystem::path assetDirectory = projectPath.filename().string() + ".assets";
-            std::filesystem::create_directories(projectPath.parent_path().empty() ? std::filesystem::path(".") / assetDirectory : projectPath.parent_path() / assetDirectory);
+            const std::filesystem::path assetFolder = (projectPath.parent_path().empty() ?
+                std::filesystem::path(".") : projectPath.parent_path()) / assetDirectory;
+            std::error_code directoryError;
+            std::filesystem::create_directories(assetFolder, directoryError);
+            if (directoryError) { audioError = "Could not create the project media directory."; return; }
             std::unordered_map<std::string, std::string> copiedAssets;
             for (size_t i = 0; i < audioClips.size(); ++i)
             {
@@ -1844,8 +1871,6 @@ int main()
                 std::filesystem::path source(c->path);
                 std::string extension = source.extension().string();
                 if (extension.empty()) extension = ".audio";
-                const std::filesystem::path assetFolder = (projectPath.parent_path().empty() ? std::filesystem::path(".") : projectPath.parent_path()) / assetDirectory;
-
                 std::error_code copyError;
                 std::string assetName;
                 const std::string sourceKey = source.string();
@@ -1874,7 +1899,6 @@ int main()
                     }
                     copiedAssets[sourceKey] = assetName;
                 }
-                const std::filesystem::path assetPath = assetFolder / assetName;
                 std::string storedPath = (assetDirectory / assetName).string();
                 out << std::quoted(storedPath) << ' ' << std::quoted(c->name) << ' ' << c->startSeconds << ' ' << c->duration << ' ' << c->trackIndex << ' ' << c->sampleRate << ' ' << c->sourceOffsetSeconds << ' ' << c->gain
                     << ' ' << c->fadeInSeconds << ' ' << c->fadeOutSeconds << '\n';
@@ -1933,10 +1957,8 @@ int main()
                 }
             }
 
-            // std::filesystem::rename replaces an existing target on Windows and macOS alike.
-            std::error_code finalizeError;
-            std::filesystem::rename(tempPath, path, finalizeError);
-            if (finalizeError)
+            if (!MoveFileExA(tempPath.c_str(), path.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
             {
                 audioError = "Could not finalize project save. Previous project was kept.";
                 return;
@@ -1945,6 +1967,24 @@ int main()
             currentProjectPath = path;
             audioError = "Project saved safely: " + path + (std::filesystem::exists(backupPath) ? "  |  Backup: .bak" : "");
             savedHash = projectHash();
+        };
+    auto confirmReplace = [&]() -> bool
+        {
+            if (recordingState.active.load())
+            { audioError = "Stop recording before opening or creating a project."; return false; }
+            if (!undoInit || projectHash() == savedHash) return true;
+            const bool wasLocked = uiLock.owns_lock();
+            if (wasLocked) uiLock.unlock();
+            const int answer = MessageBoxA(glfwGetWin32Window(window),
+                "Save changes to the current project before replacing it?",
+                "Unsaved changes", MB_YESNOCANCEL | MB_ICONQUESTION);
+            if (wasLocked) uiLock.lock();
+            if (answer == IDYES)
+            {
+                saveProject();
+                return projectHash() == savedHash;
+            }
+            return answer == IDNO;
         };
     auto loadProject = [&]()
         {
@@ -1956,10 +1996,36 @@ int main()
             std::ifstream in(filePath, std::ios::binary); std::string magic; int version = 0;
             in >> magic >> version;
             if (!in || magic != "EASYMIX" || (version < 2 || version > 6)) { audioError = "Invalid or unsupported .emix project."; return; }
+            if (!confirmReplace()) return;
 
+            const ProjectSnapshot previous = captureSnapshot();
+            const std::string previousPath = currentProjectPath;
+            const float oldZoom = timelineZoom, oldPlayhead = playheadPosition;
+            const float oldLoopStart = loopStartBeat, oldLoopEnd = loopEndBeat;
+            const float oldLimiterAmount = masterLimiter.amount;
+            const int oldBars = timelineBars, oldTrack = selectedTrack;
+            const bool oldLoop = loopEnabled, oldClick = metronomeOn, oldLimiter = masterLimiterOn;
+            const std::uint64_t oldSavedHash = savedHash, oldStableHash = stableHash;
+            auto rollback = [&](const char* reason)
+                {
+                    restoreSnapshot(previous);
+                    currentProjectPath = previousPath;
+                    timelineZoom = prevTimelineZoom = oldZoom;
+                    prevBpm = bpm;
+                    playheadPosition = oldPlayhead;
+                    loopStartBeat = oldLoopStart; loopEndBeat = oldLoopEnd;
+                    masterLimiter.amount = oldLimiterAmount;
+                    timelineBars = oldBars; selectedTrack = oldTrack;
+                    loopEnabled = oldLoop; metronomeOn = oldClick; masterLimiterOn = oldLimiter;
+                    savedHash = oldSavedHash; stableHash = oldStableHash;
+                    audioError = reason;
+                };
             resetProject();
 
             float loadedMaster = 1.0f; in >> bpm >> timelineZoom >> playheadPosition >> loadedMaster; masterVolume = loadedMaster;
+            if (!in || !std::isfinite(bpm) || !std::isfinite(timelineZoom) ||
+                !std::isfinite(playheadPosition) || !std::isfinite(masterVolume))
+            { rollback("Project header is damaged; current project was restored."); return; }
             bpm = std::clamp(bpm, 20.0f, 400.0f);
             timelineZoom = std::clamp(timelineZoom, 30.0f, 200.0f);
             prevTimelineZoom = timelineZoom;
@@ -1983,7 +2049,7 @@ int main()
             }
 
             size_t count = 0; in >> count;
-            if (!in || count > 256) { resetProject(); audioError = "Invalid track count."; return; }
+            if (!in || count > 256) { rollback("Invalid track count; current project was restored."); return; }
 
             tracks.clear(); trackVolumes.clear(); trackPans.clear(); trackSends.clear(); trackMuted.clear(); trackSolo.clear();
             trackEQs.clear(); effectGraphs.clear(); trackAutomation.clear(); trackVst.clear();
@@ -1999,7 +2065,7 @@ int main()
                 EffectGraph graph; size_t nn = 0, nl = 0; in >> graph.nextId >> nn >> nl;
                 if (!in || nn > 1024 || nl > 2048)
                 {
-                    resetProject(); audioError = "Invalid effect graph."; return;
+                    rollback("Invalid effect graph; current project was restored."); return;
                 }
                 graph.nodes.clear(); graph.links.clear();
                 for (size_t n = 0; n < nn; ++n)
@@ -2016,50 +2082,69 @@ int main()
                 size_t na = 0; in >> na;
                 if (!in || na > 100000)
                 {
-                    resetProject(); audioError = "Invalid automation data."; return;
+                    rollback("Invalid automation data; current project was restored."); return;
                 }
                 std::vector<AutomationPoint> points;
                 for (size_t a = 0; a < na; ++a) { AutomationPoint x; in >> x.time >> x.value; points.push_back(x); }
                 trackAutomation.push_back(std::move(points));
             }
+            if (!in) { rollback("Project track data is truncated; current project was restored."); return; }
 
             size_t clips = 0; in >> clips;
-            if (!in || clips > 10000) { resetProject(); audioError = "Invalid clip count."; return; }
+            if (!in || clips > 10000) { rollback("Invalid clip count; current project was restored."); return; }
+            int missingMedia = 0;
             for (size_t i = 0; i < clips; ++i)
             {
                 auto c = std::make_unique<AudioClip>();
                 in >> std::quoted(c->path) >> std::quoted(c->name) >> c->startSeconds >> c->duration >> c->trackIndex >> c->sampleRate >> c->sourceOffsetSeconds >> c->gain;
                 if (version >= 3) in >> c->fadeInSeconds >> c->fadeOutSeconds;
+                if (!in || !std::isfinite(c->startSeconds) || !std::isfinite(c->duration) ||
+                    !std::isfinite(c->sourceOffsetSeconds) || !std::isfinite(c->gain) ||
+                    !std::isfinite(c->fadeInSeconds) || !std::isfinite(c->fadeOutSeconds))
+                { rollback("Project clip data is invalid; current project was restored."); return; }
+                c->startSeconds = std::clamp(c->startSeconds, 0.0f, 36000.0f);
+                c->duration = std::clamp(c->duration, 0.0f, 36000.0f);
+                c->sourceOffsetSeconds = std::clamp(c->sourceOffsetSeconds, 0.0f, 36000.0f);
+                c->gain = std::clamp(c->gain, 0.0f, 4.0f);
+                c->fadeInSeconds = std::clamp(c->fadeInSeconds, 0.0f, c->duration);
+                c->fadeOutSeconds = std::clamp(c->fadeOutSeconds, 0.0f, c->duration);
                 std::filesystem::path mediaPath(c->path);
                 if (mediaPath.is_relative()) mediaPath = std::filesystem::path(filePath).parent_path() / mediaPath;
                 c->path = mediaPath.string();
-                if (!in || !std::filesystem::exists(c->path)) continue;
                 if (c->trackIndex < 0 || c->trackIndex >= static_cast<int>(tracks.size())) continue;
-                c->pcm = LoadPcm(c->path);
-                if (!c->pcm) continue;
+                if (std::filesystem::exists(c->path)) c->pcm = LoadPcm(c->path);
+                if (!c->pcm) ++missingMedia;
                 c->sampleRate = kEngineRate;
                 buildWaveform(*c); audioClips.push_back(std::move(c));
             }
 
-            if (version >= 3 && in)
+            if (version >= 3)
             {
                 size_t nm = 0; in >> nm;
-                if (in && nm < 1000000)
+                if (!in || nm > 1000000)
+                { rollback("Invalid MIDI data; current project was restored."); return; }
+                for (size_t i = 0; i < nm; ++i)
                 {
-                    for (size_t i = 0; i < nm; ++i)
-                    {
-                        MidiNote n;
-                        in >> n.id >> n.trackIndex >> n.pitch >> n.startBeat >> n.lengthBeats >> n.velocity;
-                        if (!in) break;
-                        if (n.trackIndex < 0 || n.trackIndex >= static_cast<int>(tracks.size())) continue;
-                        midiNotes.push_back(n);
-                        pianoRoll.nextId = std::max(pianoRoll.nextId, n.id + 1);
-                    }
+                    MidiNote n;
+                    in >> n.id >> n.trackIndex >> n.pitch >> n.startBeat >> n.lengthBeats >> n.velocity;
+                    if (!in || !std::isfinite(n.startBeat) || !std::isfinite(n.lengthBeats) || !std::isfinite(n.velocity))
+                    { rollback("Project MIDI data is truncated; current project was restored."); return; }
+                    if (n.trackIndex < 0 || n.trackIndex >= static_cast<int>(tracks.size())) continue;
+                    n.pitch = std::clamp(n.pitch, 0, 127);
+                    n.startBeat = std::clamp(n.startBeat, 0.0f, 100000.0f);
+                    n.lengthBeats = std::clamp(n.lengthBeats, 0.0625f, 100000.0f);
+                    n.velocity = std::clamp(n.velocity, 0.0f, 1.0f);
+                    midiNotes.push_back(n);
+                    pianoRoll.nextId = std::max(pianoRoll.nextId, n.id + 1);
                 }
-                for (size_t i = 0; in && i < tracks.size(); ++i)
+                for (size_t i = 0; i < tracks.size(); ++i)
                 {
                     size_t np = 0; in >> np;
-                    for (size_t k = 0; in && k < np && k < 64; ++k)
+                    if (!in || np > 64)
+                    { rollback("Invalid VST3 rack; current project was restored."); return; }
+                    if (!EasyMixVst3Available && np > 0)
+                    { rollback("This project uses VST3. Enable VST3 before opening it to protect plugin state."); return; }
+                    for (size_t k = 0; k < np; ++k)
                     {
                         std::string p; in >> std::quoted(p);
                         std::vector<unsigned char> pluginState;
@@ -2069,6 +2154,7 @@ int main()
                             in >> std::quoted(stateText);
                             pluginState = HexToBytes(stateText);
                         }
+                        if (!in) { rollback("Project VST3 data is truncated; current project was restored."); return; }
                         auto plug = std::make_shared<Vst3Plugin>();
                         if (plug->load(p, 44100.0, 4096))
                         {
@@ -2081,38 +2167,41 @@ int main()
                 }
             }
 
-            if (version >= 5 && in)
+            if (version >= 5)
             {
                 size_t nmk = 0; in >> nmk;
-                if (in && nmk < 100000)
+                if (!in || nmk > 100000)
+                { rollback("Invalid marker data; current project was restored."); return; }
+                for (size_t i = 0; i < nmk; ++i)
                 {
-                    for (size_t i = 0; i < nmk; ++i)
-                    {
-                        TimelineMarker mk; in >> mk.beat >> std::quoted(mk.name);
-                        if (!in) break;
-                        markers.push_back(mk);
-                    }
+                    Marker mk; in >> mk.beat >> std::quoted(mk.name);
+                    if (!in || !std::isfinite(mk.beat))
+                    { rollback("Project markers are truncated; current project was restored."); return; }
+                    mk.beat = std::clamp(mk.beat, 0.0f, 100000.0f);
+                    markers.push_back(mk);
                 }
             }
 
-            if (version >= 6 && in)
+            if (version >= 6)
             {
                 int bo = 1, bi = 1;
                 float br = 0.8f, ba = 0.5f, bt = 0.3f, bf = 0.35f;
                 in >> bo >> bi >> br >> ba >> bt >> bf;
-                if (in)
-                {
-                    bus.on = bo != 0;
-                    bus.index = std::clamp(bi, 0, static_cast<int>(sizeof(kBusTypes) / sizeof(kBusTypes[0])) - 1);
-                    bus.ret = std::clamp(br, 0.0f, 2.0f);
-                    bus.amount = std::clamp(ba, 0.0f, 1.0f);
-                    bus.time = std::clamp(bt, 0.01f, 2.0f);
-                    bus.feedback = std::clamp(bf, 0.0f, 0.9f);
-                }
-                for (size_t i = 0; in && i < tracks.size() && i < trackSends.size(); ++i)
+                if (!in || !std::isfinite(br) || !std::isfinite(ba) ||
+                    !std::isfinite(bt) || !std::isfinite(bf))
+                { rollback("Project bus data is truncated; current project was restored."); return; }
+                bus.on = bo != 0;
+                bus.index = std::clamp(bi, 0, static_cast<int>(sizeof(kBusTypes) / sizeof(kBusTypes[0])) - 1);
+                bus.ret = std::clamp(br, 0.0f, 2.0f);
+                bus.amount = std::clamp(ba, 0.0f, 1.0f);
+                bus.time = std::clamp(bt, 0.01f, 2.0f);
+                bus.feedback = std::clamp(bf, 0.0f, 0.9f);
+                for (size_t i = 0; i < tracks.size() && i < trackSends.size(); ++i)
                 {
                     float sv = 0.0f; in >> sv;
-                    if (in) trackSends[i] = std::clamp(sv, 0.0f, 1.0f);
+                    if (!in || !std::isfinite(sv))
+                    { rollback("Project send data is truncated; current project was restored."); return; }
+                    trackSends[i] = std::clamp(sv, 0.0f, 1.0f);
                 }
                 in.clear();
                 std::string synTag;
@@ -2124,7 +2213,7 @@ int main()
                     {
                         synth::Setup su;
                         in >> su.preset >> su.gain >> su.bright >> su.attack >> su.release;
-                        if (!in) break;
+                        if (!in) { rollback("Project synth data is truncated; current project was restored."); return; }
                         su.preset = std::clamp(su.preset, 0, presetMax);
                         su.gain = std::clamp(su.gain, 0.0f, 2.0f);
                         su.bright = std::clamp(su.bright, 0.0f, 1.0f);
@@ -2135,15 +2224,29 @@ int main()
                 }
             }
 
+            if (trackSynth.size() < tracks.size()) trackSynth.resize(tracks.size());
             selectedTrack = tracks.empty() ? -1 : 0; currentProjectPath = filePath;
             undoStack.clear(); redoStack.clear(); undoInit = false;
-            if (audioError.rfind("VST3 load failed", 0) != 0)
+            if (missingMedia)
+            {
+                showMediaPool = true;
+                audioError = std::to_string(missingMedia) + " audio clips need relinking in Media Pool.";
+            }
+            else if (audioError.rfind("VST3 load failed", 0) != 0)
                 audioError = "Project loaded: " + currentProjectPath;
         };
 
-    RecordingState recordingState;
+    auto newProject = [&]()
+        {
+            if (!confirmReplace()) return;
+            resetProject();
+            undoStack.clear(); redoStack.clear(); undoInit = false;
+            savedHash = projectHash();
+        };
+
     std::string recordingFilePath;
     float recordingStartSeconds = 0.0f;
+    int recordingTrackIndex = 0;
     ma_device_config deviceConfig =
         ma_device_config_init(ma_device_type_capture);
 
@@ -2178,6 +2281,8 @@ int main()
                 audioError = "No microphone available.";
                 return;
             }
+            if (tracks.empty())
+            { audioError = "Add a track before recording."; return; }
 
             if (recordingState.active.load())
                 return;
@@ -2187,6 +2292,8 @@ int main()
             recordingStartSeconds =
                 playheadPosition * 240.0f /
                 (timelineZoom * bpm);
+            recordingTrackIndex = selectedTrack >= 0 && selectedTrack < static_cast<int>(tracks.size())
+                ? selectedTrack : 0;
             ma_encoder_config encoderConfig =
                 ma_encoder_config_init(
                     ma_encoding_format_wav,
@@ -2205,12 +2312,54 @@ int main()
                 return;
             }
 
-            recordingState.active.store(true);
+            recordingState.ring = std::make_unique<studio::RecordRing>(kEngineRate * 8);
+            recordingState.dropped.store(0);
+            recordingState.ioError.store(false);
+            recordingState.writerRunning.store(true, std::memory_order_release);
+            recordingState.active.store(true, std::memory_order_release);
+            try
+            {
+                recordingState.writer = std::thread([&recordingState]()
+                {
+                    float block[4096];
+                    while (recordingState.writerRunning.load(std::memory_order_acquire) ||
+                        recordingState.ring->size() > 0)
+                    {
+                        const size_t n = recordingState.ring->read(block, 4096);
+                        if (n > 0)
+                        {
+                            ma_uint64 written = 0;
+                            if (ma_encoder_write_pcm_frames(&recordingState.encoder, block,
+                                static_cast<ma_uint64>(n), &written) != MA_SUCCESS || written != n)
+                                recordingState.ioError.store(true);
+                        }
+                        else
+                        {
+                            std::unique_lock<std::mutex> lk(recordingState.wakeMutex);
+                            recordingState.wake.wait_for(lk, std::chrono::milliseconds(50), [&recordingState]()
+                                { return !recordingState.writerRunning.load() || recordingState.ring->size() > 0; });
+                        }
+                    }
+                });
+            }
+            catch (const std::system_error&)
+            {
+                recordingState.active.store(false, std::memory_order_release);
+                recordingState.writerRunning.store(false, std::memory_order_release);
+                ma_encoder_uninit(&recordingState.encoder);
+                recordingState.ring.reset();
+                audioError = "Could not start the recording disk writer.";
+                return;
+            }
 
             if (ma_device_start(&captureDevice) != MA_SUCCESS)
             {
-                recordingState.active.store(false);
+                recordingState.active.store(false, std::memory_order_release);
+                recordingState.writerRunning.store(false, std::memory_order_release);
+                recordingState.wake.notify_one();
+                recordingState.writer.join();
                 ma_encoder_uninit(&recordingState.encoder);
+                recordingState.ring.reset();
                 audioError = "Microphone start failed.";
                 return;
             }
@@ -2223,11 +2372,19 @@ int main()
             if (!recordingState.active.load())
                 return;
 
-            recordingState.active.store(false);
-
+            recordingState.active.store(false, std::memory_order_release);
+            const bool wasLocked = uiLock.owns_lock();
+            if (wasLocked) uiLock.unlock();
             ma_device_stop(&captureDevice);
 
+            recordingState.writerRunning.store(false, std::memory_order_release);
+            recordingState.wake.notify_one();
+            recordingState.writer.join();
+            const ma_uint64 droppedFrames = recordingState.dropped.load();
+            const bool writeFailed = recordingState.ioError.load();
             ma_encoder_uninit(&recordingState.encoder);
+            recordingState.ring.reset();
+            if (wasLocked) uiLock.lock();
 
             auto clip = std::make_unique<AudioClip>();
 
@@ -2236,7 +2393,7 @@ int main()
             std::filesystem::path path(recordingFilePath);
             clip->name = path.filename().string();
 
-            clip->pcm = LoadPcm(recordingFilePath);
+            clip->pcm = loadPcmWithoutBlockingAudio(recordingFilePath);
             if (!clip->pcm)
             {
                 audioError = "Recorded audio loading failed.";
@@ -2250,16 +2407,15 @@ int main()
 
             clip->startSeconds = std::max(0.0f, recordingStartSeconds - recordLatencyMs / 1000.0f);
 
-            clip->trackIndex =
-                selectedTrack >= 0 &&
-                selectedTrack < static_cast<int>(tracks.size())
-                ? selectedTrack
-                : 0;
+            clip->trackIndex = std::clamp(recordingTrackIndex, 0,
+                static_cast<int>(tracks.size()) - 1);
 
             buildWaveform(*clip);
             audioClips.push_back(std::move(clip));
 
-            audioError = "Recording saved and added to timeline.";
+            audioError = writeFailed ? "Recording disk write failed; check the take."
+                : droppedFrames ? "Recording saved with " + std::to_string(droppedFrames) + " dropped frames."
+                : "Recording saved and added to timeline.";
         };
 
     auto goToEnd = [&]() { playheadPosition = playheadFromFrame(computeContentEnd()); seekRequested = true; };
@@ -2309,6 +2465,7 @@ int main()
             trackEQs.emplace_back();
             effectGraphs.emplace_back();
             trackVst.emplace_back();
+            trackSynth.emplace_back();
             selectedTrack = static_cast<int>(tracks.size()) - 1;
         };
     auto swapTracks = [&](int a, int b)
@@ -2338,6 +2495,16 @@ int main()
             {
                 if (nt.trackIndex == a) nt.trackIndex = b;
                 else if (nt.trackIndex == b) nt.trackIndex = a;
+            }
+            for (auto& held : midiHeldTrack)
+            {
+                if (held.second == a) held.second = b;
+                else if (held.second == b) held.second = a;
+            }
+            if (recordingState.active.load())
+            {
+                if (recordingTrackIndex == a) recordingTrackIndex = b;
+                else if (recordingTrackIndex == b) recordingTrackIndex = a;
             }
             trackRT.clear();
             trackBuf.clear();
@@ -2442,12 +2609,14 @@ int main()
         };
 
     palette.cmds = {
+        { "New Project", "", [&] { newProject(); } },
         { "Play / Stop", "Space", [&] { if (playing) stopAllClips(); else startAllClips(); } },
         { "Go to Start", "Home", [&] { playheadPosition = 0.0f; seekRequested = true; } },
         { "Save Project", "Ctrl+S", [&] { saveProject(); } },
         { "Save Project As...", "", [&] { saveProject(std::string(), true); } },
         { "Open Project", "", [&] { loadProject(); } },
         { "Import Audio", "", [&] { importWav(); } },
+        { "Open Media Pool / Relink Audio", "", [&] { showMediaPool = true; } },
         { "Export WAV", "", [&] { exportWav(); } },
         { "Export Stems", "", [&] { exportStems(); } },
         { "Toggle Loop", "L", [&] { loopEnabled = !loopEnabled; } },
@@ -2472,10 +2641,10 @@ int main()
         { "Zoom In", "Ctrl+=", [&] { zoomBy(1.15f); } },
         { "Zoom Out", "Ctrl+-", [&] { zoomBy(1.0f / 1.15f); } },
         { "Add Marker at Playhead", "M", [&] {
-            TimelineMarker mk; mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
+            Marker mk; mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
             mk.name = "Marker " + std::to_string(markers.size() + 1);
             markers.push_back(mk);
-            std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; }); } },
+            std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; }); } },
         { "Clear All Markers", "", [&] { markers.clear(); } },
         { "Copy Selected Clip", "Ctrl+C", [&] { copyClip(); } },
         { "Paste Clip at Playhead", "Ctrl+V", [&] { pasteClip(); } },
@@ -2552,6 +2721,27 @@ else audioError = "Select a track first."; } },
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        static double lastLufsCompute = 0.0;
+        if (ImGui::GetTime() - lastLufsCompute >= 1.0)
+        {
+            lufs.computeIntegrated();
+            lastLufsCompute = ImGui::GetTime();
+        }
+
+        if (!droppedAudioPaths.empty())
+        {
+            float at = playheadPosition * 240.0f / (timelineZoom * bpm);
+            int added = 0;
+            for (const std::string& path : droppedAudioPaths)
+                if (addAudioFile(path, at))
+                {
+                    at += audioClips.back()->duration;
+                    ++added;
+                }
+            droppedAudioPaths.clear();
+            if (added) audioError = std::to_string(added) + " audio files imported at playhead.";
+        }
+
         // ---------------------------------------------------------------------
         // メインバーの表示
         // ---------------------------------------------------------------------
@@ -2559,15 +2749,14 @@ else audioError = "Select a track first."; } },
         {
             if (ImGui::BeginMenu("File"))
             {
-                if (ImGui::MenuItem("New Project"))
-                {
-                    resetProject();
-                    undoStack.clear(); redoStack.clear(); undoInit = false;
-                }
-                if (ImGui::MenuItem("Open Project")) loadProject();
+                if (ImGui::MenuItem("New Project", "Ctrl+N")) newProject();
+                if (ImGui::MenuItem("Open Project", "Ctrl+O")) loadProject();
                 if (ImGui::MenuItem("Save Project", "Ctrl+S")) saveProject();
-                if (ImGui::MenuItem("Save Project As...")) saveProject(std::string(), true);
+                if (ImGui::MenuItem("Save Project As...", "Ctrl+Shift+S")) saveProject(std::string(), true);
+                if (ImGui::MenuItem("Media Pool / Relink...")) showMediaPool = true;
                 ImGui::Separator();
+                if (ImGui::MenuItem("Import Audio...", "Ctrl+I")) importWav();
+                if (ImGui::MenuItem("Export WAV...", "Ctrl+E")) exportWav();
 
                 if (ImGui::MenuItem("Import MIDI..."))
                 {
@@ -2593,7 +2782,7 @@ else audioError = "Select a track first."; } },
                         }
                     }
                 }
-                if (ImGui::MenuItem("Export Stems...")) exportStems();
+                if (ImGui::MenuItem("Export Stems...", "Ctrl+Shift+E")) exportStems();
                 if (ImGui::MenuItem("Export OpenUtau USTX...")) showOpenUtauBridge = true;
                 if (ImGui::MenuItem("Export MIDI..."))
                 {
@@ -2714,6 +2903,7 @@ else audioError = "Select a track first."; } },
                 ImGui::MenuItem("MIDI Tools", nullptr, &showMidiTools);
                 ImGui::MenuItem("OtoMad Studio", nullptr, &showOtoMad);
                 ImGui::MenuItem("Channel Inspector", nullptr, &showInspector);
+                ImGui::MenuItem("Media Pool", nullptr, &showMediaPool);
                 ImGui::MenuItem("MIDI Input", nullptr, &showMidiIn);
                 ImGui::MenuItem("Loudness", nullptr, &showLoudness);
                 ImGui::MenuItem("OpenUtau Bridge", nullptr, &showOpenUtauBridge);
@@ -2745,8 +2935,11 @@ else audioError = "Select a track first."; } },
                     static_cast<int>(sec0 / 60.0), std::fmod(sec0, 60.0),
                     static_cast<int>(tracks.size()), static_cast<int>(audioClips.size()));
                 const float tw = ImGui::CalcTextSize(st).x;
-                ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - tw - 16.0f));
-                ImGui::TextDisabled("%s", st);
+                if (ImGui::GetWindowWidth() - ImGui::GetCursorPosX() > tw + 16.0f)
+                {
+                    ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - tw - 16.0f));
+                    ImGui::TextDisabled("%s", st);
+                }
             }
             ImGui::EndMainMenuBar();
         }
@@ -2755,14 +2948,9 @@ else audioError = "Select a track first."; } },
         // ドッキング環境の初期化および初期レイアウトの構築（リサイズ完全対応）
         // ---------------------------------------------------------------------
         ImGuiViewport* viewport = ImGui::GetMainViewport();
-        float menuBarHeight = ImGui::GetFrameHeight();
 
-        ImGui::SetNextWindowPos(
-            ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + menuBarHeight)
-        );
-        ImGui::SetNextWindowSize(
-            ImVec2(viewport->WorkSize.x, viewport->WorkSize.y - menuBarHeight)
-        );
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
         ImGui::SetNextWindowViewport(viewport->ID);
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
@@ -2798,13 +2986,7 @@ else audioError = "Select a track first."; } },
                 ImGuiDockNodeFlags_DockSpace
             );
 
-            ImGui::DockBuilderSetNodeSize(
-                dockspaceId,
-                ImVec2(
-                    viewport->WorkSize.x,
-                    viewport->WorkSize.y - menuBarHeight
-                )
-            );
+            ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
 
             ImGuiID dockIdMain = dockspaceId;
 
@@ -2812,7 +2994,7 @@ else audioError = "Select a track first."; } },
                 ImGui::DockBuilderSplitNode(
                     dockIdMain,
                     ImGuiDir_Up,
-                    0.14f,
+                    std::clamp(122.0f / std::max(1.0f, viewport->WorkSize.y), 0.14f, 0.24f),
                     nullptr,
                     &dockIdMain
                 );
@@ -2821,7 +3003,8 @@ else audioError = "Select a track first."; } },
                 ImGui::DockBuilderSplitNode(
                     dockIdMain,
                     ImGuiDir_Down,
-                    0.35f,
+                    std::clamp(270.0f / std::max(1.0f, viewport->WorkSize.y - 122.0f),
+                        0.32f, 0.48f),
                     nullptr,
                     &dockIdMain
                 );
@@ -2830,7 +3013,7 @@ else audioError = "Select a track first."; } },
                 ImGui::DockBuilderSplitNode(
                     dockIdMain,
                     ImGuiDir_Left,
-                    0.20f,
+                    0.19f,
                     nullptr,
                     &dockIdMain
                 );
@@ -2839,7 +3022,7 @@ else audioError = "Select a track first."; } },
                 ImGui::DockBuilderSplitNode(
                     dockIdMain,
                     ImGuiDir_Right,
-                    0.25f,
+                    0.24f,
                     nullptr,
                     &dockIdMain
                 );
@@ -2850,6 +3033,9 @@ else audioError = "Select a track first."; } },
             ImGui::DockBuilderDockWindow("Mixer", dockIdBottom);
             ImGui::DockBuilderDockWindow("Track Equalizer", dockIdRight);
             ImGui::DockBuilderDockWindow("Channel Inspector", dockIdRight);
+            ImGui::DockBuilderDockWindow("Transport", dockIdRight);
+            ImGui::DockBuilderDockWindow("Loudness", dockIdRight);
+            ImGui::DockBuilderDockWindow("Media Pool", dockIdBottom);
             ImGui::DockBuilderDockWindow("VST3 Rack", dockIdRight);
             ImGui::DockBuilderDockWindow("Effect Node Editor", dockIdBottom);
             ImGui::DockBuilderDockWindow("Piano Roll", dockIdBottom);
@@ -2866,11 +3052,11 @@ else audioError = "Select a track first."; } },
         ImGui::End();
 
         if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
-            saveProject();
+            saveProject(std::string(), ImGui::GetIO().KeyShift);
 
         {
             ImGuiIO& kio = ImGui::GetIO();
-            if (!kio.WantTextInput && (!live.kbdPiano || ImGui::IsKeyPressed(ImGuiKey_Space, false)))
+            if (!kio.WantTextInput && (!live.kbdPiano || kio.KeyCtrl || ImGui::IsKeyPressed(ImGuiKey_Space, false)))
             {
                 if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, true))
                 {
@@ -2881,8 +3067,11 @@ else audioError = "Select a track first."; } },
                 {
                     doRedo();
                 }
+                else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) { newProject(); }
                 else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) { loadProject(); }
-                else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_E, false)) { exportWav(); }
+                else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_I, false)) { importWav(); }
+                else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_E, false))
+                { if (kio.KeyShift) exportStems(); else exportWav(); }
                 else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Equal, true)) { zoomBy(1.15f); }
                 else if (kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Minus, true)) { zoomBy(1.0f / 1.15f); }
                 else if (!kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Space, false))
@@ -2910,11 +3099,11 @@ else audioError = "Select a track first."; } },
                 }
                 else if (!kio.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_M, false))
                 {
-                    TimelineMarker mk;
+                    Marker mk;
                     mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
                     mk.name = "Marker " + std::to_string(markers.size() + 1);
                     markers.push_back(mk);
-                    std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; });
+                    std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; });
                 }
                 else if (!kio.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_PageUp, false) || ImGui::IsKeyPressed(ImGuiKey_PageDown, false)))
                 {
@@ -2973,9 +3162,23 @@ else audioError = "Select a track first."; } },
         {
             std::vector<pro::MidiMsg> ev;
             pro::PollLive(live, midiIn, ev);
-            if (!playing) live.held.clear();
-            const bool liveTrackOk = selectedTrack >= 0 && selectedTrack < static_cast<int>(tracks.size());
             const double liveFpb = 60.0 / std::max(1.0f, bpm) * kEngineRate;
+            const double latencyBeats = recordLatencyMs / 1000.0 * bpm / 60.0;
+            const float liveBeat = std::max(0.0f, static_cast<float>(playFrame / liveFpb - latencyBeats));
+            if ((!playing || !live.midiRec) && !live.held.empty())
+            {
+                for (const auto& held : live.held)
+                {
+                    const auto trackIt = midiHeldTrack.find(held.first);
+                    const int track = trackIt != midiHeldTrack.end() ? trackIt->second : selectedTrack;
+                    if (track >= 0 && track < static_cast<int>(tracks.size()))
+                        midiNotes.push_back({ pianoRoll.nextId++, track, held.first,
+                            held.second.beat, std::max(0.0625f, liveBeat - held.second.beat), held.second.vel });
+                }
+                live.held.clear();
+                midiHeldTrack.clear();
+            }
+            const bool liveTrackOk = selectedTrack >= 0 && selectedTrack < static_cast<int>(tracks.size());
             for (const auto& lm : ev)
             {
                 if (!liveTrackOk) break;
@@ -2990,9 +3193,12 @@ else audioError = "Select a track first."; } },
                 }
                 if (live.midiRec && playing)
                 {
-                    const double lat = recordLatencyMs / 1000.0 * bpm / 60.0;
-                    const float beat = std::max(0.0f, static_cast<float>(playFrame / liveFpb - lat));
-                    if (lm.on) live.held[lm.pitch] = pro::Held{ snapToGrid(beat), lm.vel };
+                    const float beat = liveBeat;
+                    if (lm.on)
+                    {
+                        live.held[lm.pitch] = pro::Held{ snapToGrid(beat), lm.vel };
+                        midiHeldTrack[lm.pitch] = selectedTrack;
+                    }
                     else
                     {
                         auto it = live.held.find(lm.pitch);
@@ -3000,7 +3206,8 @@ else audioError = "Select a track first."; } },
                         {
                             MidiNote nn;
                             nn.id = pianoRoll.nextId++;
-                            nn.trackIndex = selectedTrack;
+                            const auto trackIt = midiHeldTrack.find(lm.pitch);
+                            nn.trackIndex = trackIt != midiHeldTrack.end() ? trackIt->second : selectedTrack;
                             nn.pitch = lm.pitch;
                             nn.startBeat = it->second.beat;
                             nn.lengthBeats = std::max(0.0625f, beat - it->second.beat);
@@ -3008,6 +3215,7 @@ else audioError = "Select a track first."; } },
                             midiNotes.push_back(nn);
                             live.held.erase(it);
                         }
+                        midiHeldTrack.erase(lm.pitch);
                     }
                 }
             }
@@ -3020,7 +3228,8 @@ else audioError = "Select a track first."; } },
         );
 
         {
-            const ImVec2 tbSize(42.0f, 32.0f);
+            const bool compactTransport = ImGui::GetContentRegionAvail().x < 1000.0f;
+            const ImVec2 tbSize(44.0f, 34.0f);
             const bool isRec = recordingState.active.load();
 
             if (CubaseToggle("|<", false, tbSize))
@@ -3048,10 +3257,10 @@ else audioError = "Select a track first."; } },
                 else startRecording();
             }
             ImGui::SameLine();
-            if (CubaseToggle("LOOP", loopEnabled, ImVec2(52.0f, 32.0f), IM_COL32(80, 160, 235, 255)))
+            if (CubaseToggle("LOOP", loopEnabled, ImVec2(54.0f, 34.0f), IM_COL32(80, 160, 235, 255)))
                 loopEnabled = !loopEnabled;
             ImGui::SameLine();
-            if (CubaseToggle("CLICK", metronomeOn, ImVec2(56.0f, 32.0f)))
+            if (CubaseToggle("CLICK", metronomeOn, ImVec2(58.0f, 34.0f)))
                 metronomeOn = !metronomeOn;
 
             const double ppsTb = pixelsPerSecond();
@@ -3071,9 +3280,13 @@ else audioError = "Select a track first."; } },
                 static_cast<int>(std::fmod(beatTb, 1.0) * 480.0));
 
             ImGui::SameLine(0.0f, 16.0f);
-            CubaseLcd(barText, ImVec2(150.0f, 32.0f), 1.5f, IM_COL32(255, 176, 60, 255));
-            ImGui::SameLine();
-            CubaseLcd(timeText, ImVec2(150.0f, 32.0f), 1.5f, IM_COL32(110, 225, 170, 255));
+            CubaseLcd(barText, ImVec2(compactTransport ? 130.0f : 150.0f, 34.0f), 1.4f,
+                IM_COL32(255, 176, 90, 255));
+            if (!compactTransport)
+            {
+                ImGui::SameLine();
+                CubaseLcd(timeText, ImVec2(150.0f, 34.0f), 1.4f, IM_COL32(110, 225, 190, 255));
+            }
 
             ImGui::SameLine(0.0f, 12.0f);
             ImGui::SetNextItemWidth(92.0f);
@@ -3097,33 +3310,25 @@ else audioError = "Select a track first."; } },
                 lastTapTime = nowT;
             }
 
-            ImGui::SameLine();
-            ImGui::TextColored(
-                isRec ? ImVec4(1.0f, 0.3f, 0.3f, 1.0f)
-                : playing ? ImVec4(0.35f, 0.9f, 0.5f, 1.0f)
-                : ImVec4(0.6f, 0.6f, 0.64f, 1.0f),
-                isRec ? "RECORDING" : playing ? "PLAYING" : "STOPPED");
-
-            if (ImGui::Button("ADD TRACK", ImVec2(96.0f, 26.0f)))
+            if (!compactTransport)
             {
-                tracks.push_back("Track " + std::to_string(tracks.size() + 1));
-                trackVolumes.push_back(1.0f);
-                trackMuted.push_back(false);
-                trackSolo.push_back(false);
-                trackPans.push_back(0.0f);
-                trackSends.push_back(0.0f);
-                trackAutomation.emplace_back();
-                trackEQs.emplace_back();
-                effectGraphs.emplace_back();
-                trackVst.emplace_back();
-                selectedTrack = static_cast<int>(tracks.size()) - 1;
+                ImGui::SameLine();
+                ImGui::TextColored(
+                    isRec ? ImVec4(1.0f, 0.3f, 0.3f, 1.0f)
+                    : playing ? ImVec4(0.35f, 0.9f, 0.5f, 1.0f)
+                    : ImVec4(0.6f, 0.6f, 0.64f, 1.0f),
+                    isRec ? "RECORDING" : playing ? "PLAYING" : "READY");
             }
+
+            if (ImGui::Button("+ TRACK", ImVec2(88.0f, 26.0f))) addTrack();
             ImGui::SameLine();
             if (ImGui::Button("IMPORT", ImVec2(70.0f, 26.0f))) importWav();
             ImGui::SameLine();
             if (ImGui::Button("EXPORT", ImVec2(70.0f, 26.0f))) exportWav();
             ImGui::SameLine();
             if (ImGui::Button("SAVE", ImVec2(60.0f, 26.0f))) saveProject();
+            ImGui::SameLine();
+            if (ImGui::Button("MEDIA", ImVec2(64.0f, 26.0f))) showMediaPool = !showMediaPool;
             ImGui::SameLine(0.0f, 16.0f);
             if (CubaseToggle("MIXER", showMixer, ImVec2(70.0f, 26.0f))) showMixer = !showMixer;
             ImGui::SameLine();
@@ -3137,6 +3342,14 @@ else audioError = "Select a track first."; } },
                     showNodeEditor = !showNodeEditor;
                 else
                     audioError = "Select a track before opening the Node Editor.";
+            }
+            const std::string projectLabel = (projectDirty ? "* " : "") +
+                (currentProjectPath.empty() ? std::string("Untitled project") :
+                    std::filesystem::path(currentProjectPath).filename().string());
+            if (ImGui::GetContentRegionAvail().x > ImGui::CalcTextSize(projectLabel.c_str()).x + 20.0f)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", projectLabel.c_str());
             }
         }
         ImGui::End();
@@ -3193,6 +3406,9 @@ else audioError = "Select a track first."; } },
             const char* bitNames[] = { "16-bit", "24-bit", "32-bit float" };
             ImGui::SetNextItemWidth(120.0f);
             ImGui::Combo("Export format", &exportBits, bitNames, IM_ARRAYSIZE(bitNames));
+            ImGui::Checkbox("Export loop range only", &exportLoopOnly);
+            if (exportLoopOnly && !loopEnabled)
+                ImGui::TextDisabled("Enable LOOP and set start/end in Transport.");
             ImGui::SetNextItemWidth(120.0f);
             ImGui::SliderFloat("Rec latency (ms)", &recordLatencyMs, 0.0f, 300.0f, "%.0f");
             ImGui::Checkbox("Normalize on export", &exportNormalize);
@@ -3220,134 +3436,123 @@ else audioError = "Select a track first."; } },
 
         ImGui::Begin("Track Panel");
 
-        ImGui::Text("TRACKS");
-        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.40f, 0.83f, 0.79f, 1.0f), "CHANNELS");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%02d", static_cast<int>(tracks.size()));
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##tracksearch", "Search tracks...", trackFilter, sizeof(trackFilter));
+        std::string query(trackFilter);
+        std::transform(query.begin(), query.end(), query.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-        for (int i = 0; i < static_cast<int>(tracks.size()); i++)
+        ImGui::BeginChild("##trackrows", ImVec2(0.0f,
+            std::max(120.0f, ImGui::GetContentRegionAvail().y - 132.0f)));
+        for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
         {
+            std::string lower = tracks[i];
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (!query.empty() && lower.find(query) == std::string::npos) continue;
+
+            ImGui::PushID(i);
+            const float rowWidth = ImGui::GetContentRegionAvail().x;
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 5.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 3.0f));
+            ImGui::BeginChild("track", ImVec2(0.0f, 64.0f), ImGuiChildFlags_Borders,
+                ImGuiWindowFlags_NoScrollbar);
+            const ImVec2 corner = ImGui::GetWindowPos();
+            ImGui::GetWindowDrawList()->AddRectFilled(corner,
+                ImVec2(corner.x + 4.0f, corner.y + 64.0f), CubaseTrackColor(i));
+
             if (renamingTrack && selectedTrack == i)
             {
-                ImGui::SetNextItemWidth(-1);
-
-                if (ImGui::InputText(
-                    "##RenameTrack",
-                    renameBuffer,
-                    sizeof(renameBuffer),
-                    ImGuiInputTextFlags_EnterReturnsTrue
-                ))
+                ImGui::SetNextItemWidth(std::max(48.0f, rowWidth - 88.0f));
+                if (ImGui::InputText("##rename", renameBuffer, sizeof(renameBuffer),
+                    ImGuiInputTextFlags_EnterReturnsTrue))
                 {
-                    if (renameBuffer[0] != '\0')
-                        tracks[i] = renameBuffer;
-
+                    if (renameBuffer[0]) tracks[i] = renameBuffer;
                     renamingTrack = false;
                 }
-
-                if (ImGui::IsKeyPressed(ImGuiKey_Escape))
-                    renamingTrack = false;
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape)) renamingTrack = false;
             }
             else
             {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(CubaseTrackColor(i)));
-                if (ImGui::Selectable(
-                    tracks[i].c_str(),
-                    selectedTrack == i
-                ))
-                {
-                    selectedTrack = i;
-                }
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImGui::ColorConvertU32ToFloat4(CubaseTrackColor(i)));
+                if (ImGui::Selectable(tracks[i].c_str(), selectedTrack == i, 0,
+                    ImVec2(std::max(48.0f, rowWidth - 88.0f), 23.0f))) selectedTrack = i;
                 ImGui::PopStyleColor();
-
-                if (ImGui::IsItemHovered() &&
-                    ImGui::IsMouseDoubleClicked(
-                        ImGuiMouseButton_Left))
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 {
                     selectedTrack = i;
-
-                    strcpy_s(
-                        renameBuffer,
-                        sizeof(renameBuffer),
-                        tracks[i].c_str()
-                    );
-
+                    std::snprintf(renameBuffer, sizeof(renameBuffer), "%s", tracks[i].c_str());
                     renamingTrack = true;
                 }
-            }
-        }
-
-        ImGui::Separator();
-
-        if (ImGui::Button("ADD TRACK"))
-        {
-            tracks.push_back(
-                "Track " + std::to_string(tracks.size() + 1)
-            );
-
-            trackVolumes.push_back(1.0f);
-            trackMuted.push_back(false);
-            trackSolo.push_back(false);
-            trackPans.push_back(0.0f);
-            trackSends.push_back(0.0f);
-            trackAutomation.emplace_back();
-            trackEQs.emplace_back();
-            effectGraphs.emplace_back();
-            trackVst.emplace_back();
-
-            selectedTrack =
-                static_cast<int>(tracks.size()) - 1;
-        }
-
-        ImGui::SameLine();
-
-        if (ImGui::Button("DELETE TRACK"))
-        {
-            if (selectedTrack >= 0 &&
-                selectedTrack < static_cast<int>(tracks.size()))
-            {
-                int deletedTrack = selectedTrack;
-
-                stopAllClips();
-                clearMidiPlayback();
-                playing = false;
-
-                selectedClipPtr = nullptr;
-                contextClipIndex = -1;
-                draggingClipIndex = -1;
-                draggingAudioClip = false;
-
-                audioClips.erase(
-                    std::remove_if(
-                        audioClips.begin(),
-                        audioClips.end(),
-                        [deletedTrack](const std::unique_ptr<AudioClip>& c) { return c->trackIndex == deletedTrack; }
-                    ),
-                    audioClips.end()
-                );
-
-                for (auto& clip : audioClips)
+                if (ImGui::BeginDragDropSource())
                 {
-                    if (clip->trackIndex > deletedTrack)
-                        clip->trackIndex--;
+                    ImGui::SetDragDropPayload("EASYMIX_TRACK", &i, sizeof(i));
+                    ImGui::Text("Move %s", tracks[i].c_str());
+                    ImGui::EndDragDropSource();
                 }
+                if (ImGui::BeginDragDropTarget())
+                {
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("EASYMIX_TRACK"))
+                        if (payload->DataSize == sizeof(int)) swapTracks(*static_cast<const int*>(payload->Data), i);
+                    ImGui::EndDragDropTarget();
+                }
+            }
+            ImGui::SameLine(0.0f, 3.0f);
+            if (CubaseToggle("M", trackMuted[i], ImVec2(25.0f, 23.0f), IM_COL32(215, 84, 80, 255)))
+                trackMuted[i] = !trackMuted[i];
+            ImGui::SameLine(0.0f, 3.0f);
+            if (CubaseToggle("S", trackSolo[i], ImVec2(25.0f, 23.0f), IM_COL32(237, 187, 79, 255)))
+                trackSolo[i] = !trackSolo[i];
+            ImGui::TextDisabled("%02d  /  %+.1f dB", i + 1,
+                20.0f * std::log10(std::max(trackVolumes[i], 0.0001f)));
+            ImGui::ProgressBar(i < static_cast<int>(trackPeak.size()) ?
+                std::clamp(trackPeak[i], 0.0f, 1.0f) : 0.0f, ImVec2(-1.0f, 4.0f), "");
+            ImGui::EndChild();
+            ImGui::PopStyleVar(2);
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
 
-                midiNotes.erase(
-                    std::remove_if(
-                        midiNotes.begin(),
-                        midiNotes.end(),
-                        [deletedTrack](const MidiNote& n) { return n.trackIndex == deletedTrack; }
-                    ),
-                    midiNotes.end()
-                );
-                for (auto& n : midiNotes)
-                    if (n.trackIndex > deletedTrack) n.trackIndex--;
-                pianoRoll.selectedId = -1;
-                pianoRoll.dragId = -1;
-
+        if (ImGui::Button("+ Add track", ImVec2(-1.0f, 28.0f)))
+        { addTrack(); trackFilter[0] = 0; }
+        if (ImGui::Button("Duplicate", ImVec2(80.0f, 25.0f)))
+        { duplicateTrack(selectedTrack); trackFilter[0] = 0; }
+        ImGui::SameLine();
+        if (ImGui::Button("Delete...", ImVec2(80.0f, 25.0f)) && selectedTrack >= 0)
+            ImGui::OpenPopup("Delete track?");
+        if (ImGui::BeginPopupModal("Delete track?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::TextWrapped("Delete '%s' and all of its audio and MIDI?",
+                tracks[selectedTrack].c_str());
+            if (recordingState.active.load()) ImGui::TextDisabled("Stop recording before deleting a track.");
+            ImGui::BeginDisabled(recordingState.active.load());
+            if (ImGui::Button("Delete track and content"))
+            {
+                const int deletedTrack = selectedTrack;
+                stopAllClips();
+                live.held.clear();
+                midiHeldTrack.clear();
+                selectedClipPtr = nullptr;
+                contextClipIndex = draggingClipIndex = -1;
+                draggingAudioClip = false;
+                audioClips.erase(std::remove_if(audioClips.begin(), audioClips.end(),
+                    [deletedTrack](const std::unique_ptr<AudioClip>& c)
+                    { return c->trackIndex == deletedTrack; }), audioClips.end());
+                for (auto& c : audioClips) if (c->trackIndex > deletedTrack) --c->trackIndex;
+                midiNotes.erase(std::remove_if(midiNotes.begin(), midiNotes.end(),
+                    [deletedTrack](const MidiNote& n)
+                    { return n.trackIndex == deletedTrack; }), midiNotes.end());
+                for (auto& n : midiNotes) if (n.trackIndex > deletedTrack) --n.trackIndex;
+                pianoRoll.sel.clear(); pianoRoll.selectedId = pianoRoll.dragId = -1;
                 trackVolumes.erase(trackVolumes.begin() + deletedTrack);
                 trackMuted.erase(trackMuted.begin() + deletedTrack);
                 trackSolo.erase(trackSolo.begin() + deletedTrack);
                 trackPans.erase(trackPans.begin() + deletedTrack);
-                if (static_cast<int>(trackSends.size()) > deletedTrack)
-                    trackSends.erase(trackSends.begin() + deletedTrack);
+                trackSends.erase(trackSends.begin() + deletedTrack);
                 if (static_cast<int>(trackSynth.size()) > deletedTrack)
                     trackSynth.erase(trackSynth.begin() + deletedTrack);
                 trackAutomation.erase(trackAutomation.begin() + deletedTrack);
@@ -3355,23 +3560,22 @@ else audioError = "Select a track first."; } },
                 effectGraphs.erase(effectGraphs.begin() + deletedTrack);
                 trackVst.erase(trackVst.begin() + deletedTrack);
                 tracks.erase(tracks.begin() + deletedTrack);
-                trackRT.clear();
-                trackBuf.clear();
-
-                selectedTrack = -1;
+                trackRT.clear(); trackBuf.clear(); trackPeak.clear();
+                selectedTrack = std::min(deletedTrack, static_cast<int>(tracks.size()) - 1);
                 renamingTrack = false;
+                ImGui::CloseCurrentPopup();
             }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
         }
-
-        ImGui::Separator();
         if (ImGui::Button("Up")) swapTracks(selectedTrack, selectedTrack - 1);
         ImGui::SameLine();
         if (ImGui::Button("Down")) swapTracks(selectedTrack, selectedTrack + 1);
         ImGui::SameLine();
-        if (ImGui::Button("Duplicate")) duplicateTrack(selectedTrack);
-        if (ImGui::Button("Unmute/Unsolo All")) { std::fill(trackMuted.begin(), trackMuted.end(), false); std::fill(trackSolo.begin(), trackSolo.end(), false); }
-        ImGui::SameLine();
-        if (ImGui::Button("Reset Faders")) resetFaders();
+        if (ImGui::Button("Clear M / S"))
+        { std::fill(trackMuted.begin(), trackMuted.end(), false); std::fill(trackSolo.begin(), trackSolo.end(), false); }
 
         ImGui::End();
 
@@ -3422,9 +3626,89 @@ else audioError = "Select a track first."; } },
                     ImGui::Text("MIDI Notes     %d", noteCount);
                     ImGui::Text("Audio Clips    %d", clipCount);
                     ImGui::Text("Automation     %d", t < static_cast<int>(trackAutomation.size()) ? static_cast<int>(trackAutomation[t].size()) : 0);
-                    if (ImGui::Button("Open EQ", ImVec2(-1, 25))) showMixer = true;
+                    if (ImGui::Button("Open EQ", ImVec2(-1, 25))) ImGui::SetWindowFocus("Track Equalizer");
                     if (ImGui::Button("Open VST3 Rack", ImVec2(-1, 25))) showVstRack = true;
                     if (ImGui::Button("Open Piano Roll", ImVec2(-1, 25))) showPianoRoll = true;
+                }
+            }
+            ImGui::End();
+        }
+
+        if (showMediaPool)
+        {
+            ImGui::SetNextWindowSize(ImVec2(720.0f, 360.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Media Pool", &showMediaPool))
+            {
+                const int missing = static_cast<int>(std::count_if(audioClips.begin(), audioClips.end(),
+                    [](const std::unique_ptr<AudioClip>& c) { return !c->pcm; }));
+                ImGui::Text("%d audio events  /  %d offline", static_cast<int>(audioClips.size()), missing);
+                ImGui::SameLine();
+                ImGui::TextDisabled("Drop WAV / MP3 / FLAC files into the window to import");
+                if (missing)
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.40f, 1.0f),
+                        "Locate missing files before saving or exporting.");
+                if (ImGui::BeginTable("media", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                    ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                    ImVec2(0.0f, -1.0f)))
+                {
+                    ImGui::TableSetupColumn("Clip", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+                    ImGui::TableSetupColumn("Track");
+                    ImGui::TableSetupColumn("Length");
+                    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 88.0f);
+                    ImGui::TableHeadersRow();
+                    for (auto& clip : audioClips)
+                    {
+                        ImGui::PushID(clip.get());
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        if (ImGui::Selectable(clip->name.c_str(), selectedClipPtr == clip.get()))
+                        { selectedClipPtr = clip.get(); selectedTrack = clip->trackIndex; }
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", clip->path.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(clip->trackIndex >= 0 && clip->trackIndex < static_cast<int>(tracks.size())
+                            ? tracks[clip->trackIndex].c_str() : "-");
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.1f s", clip->duration);
+                        ImGui::TableNextColumn();
+                        if (clip->pcm) ImGui::TextColored(ImVec4(0.32f, 0.83f, 0.64f, 1.0f), "ONLINE");
+                        else if (ImGui::SmallButton("Locate..."))
+                        {
+                            char fp[MAX_PATH] = {};
+                            OPENFILENAMEA d = {}; d.lStructSize = sizeof(d);
+                            d.hwndOwner = glfwGetWin32Window(window);
+                            d.lpstrFile = fp; d.nMaxFile = MAX_PATH;
+                            d.lpstrFilter = "Audio Files\0*.wav;*.mp3;*.flac\0All Files\0*.*\0";
+                            d.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                            if (DialogOpen(&d))
+                            {
+                                auto pcm = loadPcmWithoutBlockingAudio(fp);
+                                if (!pcm) audioError = "Could not decode the replacement audio.";
+                                else
+                                {
+                                    const std::string oldPath = clip->path;
+                                    const float available = static_cast<float>(pcm->size() / 2) / kEngineRate;
+                                    int relinked = 0;
+                                    for (auto& other : audioClips)
+                                        if (!other->pcm && other->path == oldPath)
+                                        {
+                                            other->path = fp;
+                                            other->pcm = pcm;
+                                            other->sampleRate = kEngineRate;
+                                            other->sourceOffsetSeconds = std::min(other->sourceOffsetSeconds, available);
+                                            other->duration = std::min(other->duration,
+                                                std::max(0.0f, available - other->sourceOffsetSeconds));
+                                            other->fadeInSeconds = std::min(other->fadeInSeconds, other->duration);
+                                            other->fadeOutSeconds = std::min(other->fadeOutSeconds, other->duration);
+                                            buildWaveform(*other);
+                                            ++relinked;
+                                        }
+                                    audioError = std::to_string(relinked) + " audio clips relinked.";
+                                }
+                            }
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
                 }
             }
             ImGui::End();
@@ -3437,6 +3721,8 @@ else audioError = "Select a track first."; } },
             {
                 ImGui::TextColored(ImVec4(0.95f, 0.62f, 0.20f, 1.0f), "EASYMIX  <->  OPENUTAU");
                 ImGui::TextDisabled("OpenUtau USTX export + real-time VST3 bridge.");
+                if (!EasyMixVst3Available)
+                    ImGui::TextDisabled("Real-time bridge unavailable: build with EASYMIX_ENABLE_VST3=1. USTX export still works.");
                 ImGui::Separator();
 
                 ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.65f, 1.0f), "REAL-TIME OPENUTAU LINK");
@@ -3703,39 +3989,29 @@ else audioError = "Select a track first."; } },
 
         if (showMixer)
         {
-            ImGui::Begin("Mixer", &showMixer);
-            ImGui::Checkbox("Snap", &snapEnabled);
+            const float stripW = 98.0f;
+            ImGui::SetNextWindowContentSize(ImVec2(
+                static_cast<float>(tracks.size()) * (stripW + 9.0f) + stripW + 44.0f, 0.0f));
+            ImGui::Begin("Mixer", &showMixer, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextColored(ImVec4(0.40f, 0.83f, 0.79f, 1.0f), "MIX CONSOLE");
             ImGui::SameLine();
-            ImGui::SetNextItemWidth(100.0f);
-            if (ImGui::BeginCombo("Grid", snapOptionNames[
-                snapBeat == 1.0f ? 0 :
-                    snapBeat == 0.5f ? 1 :
-                    snapBeat == 0.25f ? 2 :
-                    snapBeat == 0.125f ? 3 : 4
-            ]))
-            {
-                for (int i = 0; i < IM_ARRAYSIZE(snapOptions); i++)
-                {
-                    bool selected = snapBeat == snapOptions[i];
-                    if (ImGui::Selectable(snapOptionNames[i], selected))
-                        snapBeat = snapOptions[i];
-                    if (selected)
-                        ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
+            ImGui::TextDisabled("%d channels  /  stereo master", static_cast<int>(tracks.size()));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("SEND BUS")) showBus = true;
             ImGui::Separator();
 
             if (trackSends.size() != tracks.size()) trackSends.resize(tracks.size(), 0.0f);
-            const float stripW = 96.0f;
-            const float stripH = 362.0f;
-            const float faderH = 190.0f;
+            if (trackHold.size() != tracks.size()) trackHold.resize(tracks.size());
+            const float stripH = std::max(220.0f, ImGui::GetContentRegionAvail().y - 6.0f);
+            const float faderH = std::max(72.0f, stripH - 165.0f);
 
             for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
             {
                 ImGui::PushID(i);
                 if (i > 0) ImGui::SameLine();
 
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 7.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 5.0f));
                 ImGui::BeginChild("strip", ImVec2(stripW, stripH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
                 ImDrawList* sd = ImGui::GetWindowDrawList();
 
@@ -3766,16 +4042,18 @@ else audioError = "Select a track first."; } },
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) trackVolumes[i] = 1.0f;
                 ImGui::SameLine();
 
-                if (trackHold.size() != tracks.size()) trackHold.resize(tracks.size());
                 DrawMeterBar(ImVec2(14.0f, faderH), i < static_cast<int>(trackPeak.size()) ? trackPeak[i] : 0.0f, trackHold[i]);
 
                 ImGui::Text("%.1f dB", 20.0f * std::log10(std::max(trackVolumes[i], 0.0001f)));
 
                 ImGui::EndChild();
+                ImGui::PopStyleVar(2);
                 ImGui::PopID();
             }
 
-            ImGui::SameLine();
+            if (!tracks.empty()) ImGui::SameLine();
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 7.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 5.0f));
             ImGui::BeginChild("masterstrip", ImVec2(stripW + 20.0f, stripH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
             {
                 ImDrawList* sd = ImGui::GetWindowDrawList();
@@ -3797,6 +4075,7 @@ else audioError = "Select a track first."; } },
                 ImGui::Text("%.1f dB", 20.0f * std::log10(std::max(masterVolume, 0.0001f)));
             }
             ImGui::EndChild();
+            ImGui::PopStyleVar(2);
             ImGui::End();
         }
 
@@ -3925,6 +4204,8 @@ else audioError = "Select a track first."; } },
             if (selectedTrack >= 0 && selectedTrack < static_cast<int>(tracks.size()))
             {
                 ImGui::Text("Track: %s", tracks[selectedTrack].c_str());
+                if (!EasyMixVst3Available)
+                    ImGui::TextDisabled("VST3 unavailable in this build; the built-in synth is ready.");
 
                 if (ImGui::Button("Scan VST3"))
                 {
@@ -4098,7 +4379,7 @@ else audioError = "Select a track first."; } },
                     }
                 }
 
-                ImGui::TextDisabled("(Snap / Grid use the Mixer window settings)");
+                ImGui::TextDisabled("(Snap / Grid use the Arrangement toolbar)");
 
                 float playheadBeat = playheadPosition * 4.0f / timelineZoom;
                 DrawPianoRoll(
@@ -4130,6 +4411,9 @@ else audioError = "Select a track first."; } },
         {
             ImGui::SetNextWindowSize(ImVec2(520, 420), ImGuiCond_FirstUseEver);
             ImGui::Begin("VST3 Rack", &showVstRack);
+
+            if (!EasyMixVst3Available)
+                ImGui::TextDisabled("VST3 is disabled. Set EASYMIX_ENABLE_VST3=1 and link a matching VST3 SDK to enable it.");
 
             if (ImGui::Button("Scan VST3"))
                 vst3Found = ScanVst3Folders();
@@ -4656,11 +4940,11 @@ else audioError = "Select a track first."; } },
 
             if (ImGui::Button("Add at Playhead (M)"))
             {
-                TimelineMarker mk;
+                Marker mk;
                 mk.beat = std::max(0.0f, snapToGrid(playheadPosition * 4.0f / timelineZoom));
                 mk.name = "Marker " + std::to_string(markers.size() + 1);
                 markers.push_back(mk);
-                std::sort(markers.begin(), markers.end(), [](const TimelineMarker& a, const TimelineMarker& b) { return a.beat < b.beat; });
+                std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) { return a.beat < b.beat; });
             }
             ImGui::SameLine();
             ImGui::TextDisabled("PageUp / PageDown: prev / next");
@@ -4711,17 +4995,44 @@ else audioError = "Select a track first."; } },
 
         ImGui::Begin("Timeline");
 
-        ImGui::Text("ARRANGEMENT");
+        const float editorWidth = ImGui::GetContentRegionAvail().x;
+        ImGui::TextColored(ImVec4(0.40f, 0.83f, 0.79f, 1.0f), "ARRANGEMENT");
         ImGui::SameLine();
+        ImGui::TextDisabled("%d tracks  /  %d clips",
+            static_cast<int>(tracks.size()), static_cast<int>(audioClips.size()));
 
-        ImGui::SetNextItemWidth(150);
-
-        ImGui::SliderFloat(
-            "Zoom",
-            &timelineZoom,
-            30.0f,
-            200.0f
-        );
+        if (CubaseToggle("SNAP", snapEnabled, ImVec2(55.0f, 26.0f))) snapEnabled = !snapEnabled;
+        ImGui::SameLine();
+        const int gridIndex = snapBeat == 1.0f ? 0 : snapBeat == 0.5f ? 1 :
+            snapBeat == 0.25f ? 2 : snapBeat == 0.125f ? 3 : 4;
+        ImGui::SetNextItemWidth(78.0f);
+        if (ImGui::BeginCombo("##arrangeGrid", snapOptionNames[gridIndex]))
+        {
+            for (int i = 0; i < IM_ARRAYSIZE(snapOptions); ++i)
+                if (ImGui::Selectable(snapOptionNames[i], snapBeat == snapOptions[i]))
+                    snapBeat = snapOptions[i];
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine(0.0f, 14.0f);
+        if (ImGui::Button("-##timelineZoom")) zoomBy(1.0f / 1.2f);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::SliderFloat("##timelineZoom", &timelineZoom, 30.0f, 200.0f, "%.0f px/bar");
+        ImGui::SameLine();
+        if (ImGui::Button("+##timelineZoom")) zoomBy(1.2f);
+        ImGui::SameLine();
+        if (ImGui::Button("FIT"))
+        {
+            const long long end = computeContentEnd();
+            const float bars = end > 0 ? static_cast<float>(end) * bpm /
+                (kEngineRate * 240.0f) + 1.0f : static_cast<float>(timelineBars);
+            timelineZoom = std::clamp((editorWidth - 175.0f) / std::max(1.0f, bars), 30.0f, 200.0f);
+        }
+        if (editorWidth > 760.0f)
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Ctrl+wheel: zoom  |  Alt+click: automation");
+        }
 
         ImGui::Separator();
 
@@ -4759,8 +5070,8 @@ else audioError = "Select a track first."; } },
 
             displayBars = std::max(displayBars, requiredBars);
         }
-        float rowHeight = 55.0f;
-        float leftWidth = 130.0f;
+        const float rowHeight = 64.0f;
+        const float leftWidth = 164.0f;
 
         float totalWidth =
             leftWidth + displayBars * timelineZoom;
@@ -4829,7 +5140,9 @@ else audioError = "Select a track first."; } },
                 AudioClip* c = audioClips[contextClipIndex].get();
                 bool deleted = false;
 
-                if (ImGui::MenuItem("Split at Playhead"))
+                if (!c->pcm && ImGui::MenuItem("Relink in Media Pool..."))
+                { selectedClipPtr = c; showMediaPool = true; closePopup = true; }
+                if (ImGui::MenuItem("Split at Playhead", nullptr, false, c->pcm != nullptr))
                 {
                     float splitTime = playheadPosition * 240.0f / (timelineZoom * bpm);
                     float local = splitTime - c->startSeconds;
@@ -4859,7 +5172,7 @@ else audioError = "Select a track first."; } },
                     closePopup = true;
                 }
 
-                if (ImGui::MenuItem("Duplicate Clip"))
+                if (ImGui::MenuItem("Duplicate Clip", nullptr, false, c->pcm != nullptr))
                 {
                     auto copy = std::make_unique<AudioClip>();
                     copy->path = c->path;
@@ -5101,7 +5414,14 @@ else audioError = "Select a track first."; } },
             {
                 const int row = static_cast<int>(std::floor((mousePos.y - origin.y - 35.0f) / rowHeight));
                 if (row >= 0 && row < static_cast<int>(tracks.size()))
+                {
                     selectedTrack = row;
+                    const float localX = mousePos.x - origin.x - timelineScrollX;
+                    if (localX >= leftWidth - 62.0f && localX < leftWidth - 36.0f)
+                        trackMuted[row] = !trackMuted[row];
+                    else if (localX >= leftWidth - 32.0f && localX < leftWidth - 6.0f)
+                        trackSolo[row] = !trackSolo[row];
+                }
             }
             else
             {
@@ -5164,90 +5484,62 @@ else audioError = "Select a track first."; } },
             origin.y + totalHeight
         );
 
-        draw->AddRectFilled(
-            areaMin,
-            areaMax,
-            IM_COL32(30, 30, 34, 255)
-        );
-        float beatsPerBar = 4.0f;
-        float pixelsPerBeat = timelineZoom / beatsPerBar;
+        const float viewMinX = ImGui::GetWindowPos().x;
+        const float viewMaxX = viewMinX + ImGui::GetWindowSize().x;
+        const float viewMinY = ImGui::GetWindowPos().y;
+        const float viewMaxY = viewMinY + ImGui::GetWindowSize().y;
+        const float contentMinX = origin.x + timelineScrollX + leftWidth;
+        const float beatsPerBar = 4.0f;
+        const float pixelsPerBeat = timelineZoom / beatsPerBar;
 
-        if (snapBeat > 0.0f)
+        draw->AddRectFilled(areaMin, areaMax, IM_COL32(16, 22, 32, 255));
+        draw->AddRectFilled(areaMin, ImVec2(areaMax.x, origin.y + 35.0f),
+            IM_COL32(25, 35, 48, 255));
+        draw->PushClipRect(ImVec2(contentMinX, viewMinY), ImVec2(viewMaxX, viewMaxY), true);
+
+        // Paint rows first: the beat grid remains visible over the lane backgrounds.
+        for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
         {
-            int totalGridLines = static_cast<int>(
-                displayBars * beatsPerBar / snapBeat
-                );
+            const float y = origin.y + 35.0f + i * rowHeight;
+            if (y + rowHeight < viewMinY || y > viewMaxY) continue;
+            draw->AddRectFilled(ImVec2(origin.x, y), ImVec2(areaMax.x, y + rowHeight),
+                i == selectedTrack ? IM_COL32(28, 47, 57, 255)
+                : i % 2 == 0 ? IM_COL32(23, 31, 43, 255) : IM_COL32(19, 27, 38, 255));
+            draw->AddLine(ImVec2(origin.x, y + rowHeight), ImVec2(areaMax.x, y + rowHeight),
+                IM_COL32(42, 56, 71, 255));
+        }
 
-            for (int i = 0; i <= totalGridLines; i++)
+        float gridBeat = snapBeat;
+        while (gridBeat > 0.0f && gridBeat * pixelsPerBeat < 10.0f && gridBeat < 4.0f)
+            gridBeat *= 2.0f;
+        if (gridBeat > 0.0f)
+        {
+            const int firstGrid = std::max(0, static_cast<int>(std::floor(
+                (viewMinX - origin.x - leftWidth) / (pixelsPerBeat * gridBeat))));
+            const int lastGrid = std::min(static_cast<int>(displayBars * 4.0f / gridBeat),
+                static_cast<int>(std::ceil((viewMaxX - origin.x - leftWidth) /
+                    (pixelsPerBeat * gridBeat))));
+            for (int i = firstGrid; i <= lastGrid; ++i)
             {
-                float beatPosition = i * snapBeat;
-
-                float x =
-                    origin.x + leftWidth +
-                    beatPosition * pixelsPerBeat;
-
-                bool isBeatLine =
-                    std::abs(beatPosition - std::round(beatPosition)) < 0.001f;
-
-                draw->AddLine(
-                    ImVec2(x, origin.y + 35.0f),
-                    ImVec2(x, areaMax.y),
-                    isBeatLine
-                    ? IM_COL32(65, 65, 75, 255)
-                    : IM_COL32(48, 48, 55, 255),
-                    isBeatLine ? 1.0f : 0.7f
-                );
+                const float beat = i * gridBeat;
+                if (std::fabs(std::remainder(beat, 4.0f)) < 0.001f) continue;
+                const float x = origin.x + leftWidth + beat * pixelsPerBeat;
+                const bool wholeBeat = std::fabs(beat - std::round(beat)) < 0.001f;
+                draw->AddLine(ImVec2(x, origin.y + 35.0f), ImVec2(x, areaMax.y),
+                    wholeBeat ? IM_COL32(60, 77, 91, 195) : IM_COL32(46, 60, 76, 140));
             }
         }
 
-        for (int bar = 0; bar <= displayBars; bar++)
+        const int firstBar = std::max(0, static_cast<int>(std::floor(
+            (viewMinX - origin.x - leftWidth) / timelineZoom)));
+        const int lastBar = std::min(displayBars, static_cast<int>(std::ceil(
+            (viewMaxX - origin.x - leftWidth) / timelineZoom)));
+        for (int bar = firstBar; bar <= lastBar; ++bar)
         {
-            float x =
-                origin.x + leftWidth + bar * timelineZoom;
-
-            draw->AddLine(
-                ImVec2(x, origin.y),
-                ImVec2(x, areaMax.y),
-                IM_COL32(75, 75, 82, 255)
-            );
-
-            draw->AddText(
-                ImVec2(x + 5, origin.y + 5),
-                IM_COL32(220, 220, 220, 255),
-                std::to_string(bar + 1).c_str()
-            );
-        }
-
-        for (int i = 0; i < static_cast<int>(tracks.size()); i++)
-        {
-            float y =
-                origin.y + 35.0f + i * rowHeight;
-
-            draw->AddRectFilled(
-                ImVec2(origin.x, y),
-                ImVec2(
-                    origin.x + totalWidth,
-                    y + rowHeight
-                ),
-                i % 2 == 0
-                ? IM_COL32(42, 42, 48, 255)
-                : IM_COL32(36, 36, 42, 255)
-            );
-
-            draw->AddText(
-                ImVec2(origin.x + 10, y + 18),
-                IM_COL32(230, 230, 230, 255),
-                tracks[i].c_str()
-            );
-
-            draw->AddLine(
-                ImVec2(origin.x, y + rowHeight),
-                ImVec2(
-                    origin.x + totalWidth,
-                    y + rowHeight
-                ),
-                IM_COL32(65, 65, 72, 255)
-            );
+            const float x = origin.x + leftWidth + bar * timelineZoom;
+            draw->AddLine(ImVec2(x, origin.y), ImVec2(x, areaMax.y), IM_COL32(92, 115, 130, 215));
+            draw->AddText(ImVec2(x + 7.0f, origin.y + 7.0f), IM_COL32(188, 207, 220, 255),
+                std::to_string(bar + 1).c_str());
         }
 
         for (auto& clip : audioClips)
@@ -5269,6 +5561,8 @@ else audioError = "Select a track first."; } },
 
             float clipWidth =
                 clip->duration * pixelsPerSecond;
+            if (clipWidth <= 0.0f || x + clipWidth < contentMinX || x > viewMaxX ||
+                y + rowHeight < viewMinY || y > viewMaxY) continue;
 
             ImVec2 clipMin(x, y);
 
@@ -5280,7 +5574,8 @@ else audioError = "Select a track first."; } },
             draw->AddRectFilled(
                 clipMin,
                 clipMax,
-                CubaseTrackColor(clip->trackIndex),
+                clip->pcm ? CubaseTrackColor(clip->trackIndex, 210)
+                    : IM_COL32(92, 49, 58, 255),
                 5.0f
             );
 
@@ -5288,7 +5583,8 @@ else audioError = "Select a track first."; } },
             draw->AddRect(
                 clipMin,
                 clipMax,
-                clipSelected ? IM_COL32(255, 230, 120, 255) : IM_COL32(100, 190, 255, 255),
+                clipSelected ? IM_COL32(255, 211, 112, 255)
+                    : clip->pcm ? CubaseTrackColor(clip->trackIndex) : IM_COL32(240, 114, 124, 255),
                 5.0f,
                 0,
                 clipSelected ? 2.5f : 1.0f
@@ -5296,13 +5592,22 @@ else audioError = "Select a track first."; } },
 
             if (!clip->waveform.empty() && clipWidth > 4.0f)
             {
-                float midY = y + (rowHeight - 16.0f) * 0.58f;
-                float usableW = std::max(1.0f, clipWidth - 8.0f);
-                for (size_t wi = 0; wi < clip->waveform.size(); ++wi)
+                const float midY = y + (rowHeight - 16.0f) * 0.60f;
+                const float usableW = std::max(1.0f, clipWidth - 8.0f);
+                const float firstX = std::max(x + 4.0f, contentMinX);
+                const float lastX = std::min(x + clipWidth - 4.0f, viewMaxX);
+                for (float wx = firstX; wx < lastX; wx += 2.0f)
                 {
-                    float wx = x + 4.0f + usableW * static_cast<float>(wi) / static_cast<float>(clip->waveform.size());
-                    float amp = clip->waveform[wi] * (rowHeight - 25.0f) * 0.38f;
-                    draw->AddLine(ImVec2(wx, midY - amp), ImVec2(wx, midY + amp), IM_COL32(165, 220, 255, 220));
+                    const size_t first = std::min(clip->waveform.size() - 1,
+                        static_cast<size_t>(std::clamp((wx - x - 4.0f) / usableW, 0.0f, 1.0f) * clip->waveform.size()));
+                    const size_t last = std::min(clip->waveform.size(), std::max(first + 1,
+                        static_cast<size_t>(std::ceil(std::clamp((wx + 2.0f - x - 4.0f) / usableW,
+                            0.0f, 1.0f) * clip->waveform.size()))));
+                    float peak = 0.0f;
+                    for (size_t wi = first; wi < last; ++wi) peak = std::max(peak, clip->waveform[wi]);
+                    const float amp = peak * (rowHeight - 25.0f) * 0.38f;
+                    draw->AddLine(ImVec2(wx, midY - amp), ImVec2(wx, midY + amp),
+                        IM_COL32(207, 238, 250, 230));
                 }
             }
             float clipHeight = rowHeight - 16.0f;
@@ -5352,11 +5657,18 @@ else audioError = "Select a track first."; } },
                     1.0f
                 );
             }
-            draw->AddText(
-                ImVec2(x + 7.0f, y + 7.0f),
-                IM_COL32(255, 255, 255, 255),
-                clip->name.c_str()
-            );
+            if (!clip->pcm)
+                for (float hx = std::max(x, contentMinX); hx < std::min(x + clipWidth, viewMaxX); hx += 14.0f)
+                    draw->AddLine(ImVec2(hx, y + clipHeight),
+                        ImVec2(std::min(hx + 14.0f, x + clipWidth), y), IM_COL32(235, 115, 125, 65));
+            if (clipWidth > 16.0f)
+            {
+                draw->PushClipRect(ImVec2(x + 5.0f, y), ImVec2(x + clipWidth - 5.0f, y + clipHeight), true);
+                const std::string label = clip->pcm ? clip->name : "OFFLINE: " + clip->name;
+                draw->AddText(ImVec2(x + 7.0f, y + 6.0f), IM_COL32(250, 250, 253, 255),
+                    label.c_str());
+                draw->PopClipRect();
+            }
         }
 
         if (loopEnabled && loopEndBeat > loopStartBeat)
@@ -5377,6 +5689,8 @@ else audioError = "Select a track first."; } },
             float nx1 = origin.x + leftWidth + n.startBeat * pixelsPerBeat;
             float nx2 = origin.x + leftWidth + (n.startBeat + n.lengthBeats) * pixelsPerBeat;
             float rowTop = origin.y + 35.0f + n.trackIndex * rowHeight + 4.0f;
+            if (nx2 < contentMinX || nx1 > viewMaxX ||
+                rowTop > viewMaxY || rowTop + rowHeight < viewMinY) continue;
             float ny = rowTop + (1.0f - n.pitch / 127.0f) * (rowHeight - 12.0f);
 
             draw->AddRectFilled(
@@ -5393,6 +5707,7 @@ else audioError = "Select a track first."; } },
             {
                 float x1 = origin.x + leftWidth + points[ai - 1].time * pixelsPerSecond;
                 float x2 = origin.x + leftWidth + points[ai].time * pixelsPerSecond;
+                if (x2 < contentMinX || x1 > viewMaxX) continue;
                 float y1 = origin.y + 35.0f + selectedTrack * rowHeight + 8.0f + (1.0f - points[ai - 1].value / 2.0f) * (rowHeight - 16.0f);
                 float y2 = origin.y + 35.0f + selectedTrack * rowHeight + 8.0f + (1.0f - points[ai].value / 2.0f) * (rowHeight - 16.0f);
                 draw->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), IM_COL32(255, 210, 70, 255), 2.0f);
@@ -5406,6 +5721,7 @@ else audioError = "Select a track first."; } },
             }
         }
 
+        draw->PopClipRect();
         {
             const float hx = origin.x + timelineScrollX;
 
@@ -5416,38 +5732,49 @@ else audioError = "Select a track first."; } },
 
                 draw->AddRectFilled(
                     ImVec2(hx, y), ImVec2(hx + leftWidth, y + rowHeight),
-                    sel ? IM_COL32(38, 72, 82, 255) : IM_COL32(34, 34, 40, 255));
+                    sel ? IM_COL32(37, 62, 74, 255) : IM_COL32(29, 39, 52, 255));
                 draw->AddRect(
                     ImVec2(hx, y), ImVec2(hx + leftWidth, y + rowHeight),
-                    IM_COL32(65, 65, 72, 255));
+                    IM_COL32(55, 72, 87, 255));
                 draw->AddRectFilled(ImVec2(hx, y), ImVec2(hx + 5.0f, y + rowHeight), CubaseTrackColor(i));
-                draw->AddText(ImVec2(hx + 12.0f, y + 8.0f), IM_COL32(235, 235, 235, 255), tracks[i].c_str());
+                draw->PushClipRect(ImVec2(hx + 10.0f, y + 3.0f),
+                    ImVec2(hx + leftWidth - 68.0f, y + 27.0f), true);
+                draw->AddText(ImVec2(hx + 12.0f, y + 7.0f), IM_COL32(235, 241, 247, 255), tracks[i].c_str());
+                draw->PopClipRect();
+                draw->AddText(ImVec2(hx + 12.0f, y + 31.0f), IM_COL32(135, 159, 176, 255),
+                    ("CH " + std::to_string(i + 1)).c_str());
 
-                if (i < static_cast<int>(trackMuted.size()) && trackMuted[i])
-                    draw->AddText(ImVec2(hx + leftWidth - 38.0f, y + 8.0f), IM_COL32(255, 90, 90, 255), "M");
-                if (i < static_cast<int>(trackSolo.size()) && trackSolo[i])
-                    draw->AddText(ImVec2(hx + leftWidth - 22.0f, y + 8.0f), IM_COL32(255, 220, 80, 255), "S");
+                const float muteX = hx + leftWidth - 62.0f, soloX = hx + leftWidth - 32.0f;
+                draw->AddRectFilled(ImVec2(muteX, y + 6.0f), ImVec2(muteX + 26.0f, y + 30.0f),
+                    trackMuted[i] ? IM_COL32(213, 88, 91, 255) : IM_COL32(48, 63, 76, 255), 4.0f);
+                draw->AddRectFilled(ImVec2(soloX, y + 6.0f), ImVec2(soloX + 26.0f, y + 30.0f),
+                    trackSolo[i] ? IM_COL32(237, 187, 79, 255) : IM_COL32(48, 63, 76, 255), 4.0f);
+                draw->AddText(ImVec2(muteX + 7.0f, y + 10.0f), IM_COL32(245, 247, 250, 255), "M");
+                draw->AddText(ImVec2(soloX + 8.0f, y + 10.0f), IM_COL32(245, 247, 250, 255), "S");
 
                 const float pkv = i < static_cast<int>(trackPeak.size()) ? std::min(1.0f, trackPeak[i]) : 0.0f;
                 draw->AddRectFilled(
                     ImVec2(hx + 10.0f, y + rowHeight - 14.0f),
                     ImVec2(hx + leftWidth - 10.0f, y + rowHeight - 8.0f),
-                    IM_COL32(20, 22, 26, 255));
+                    IM_COL32(15, 23, 32, 255));
                 draw->AddRectFilled(
                     ImVec2(hx + 10.0f, y + rowHeight - 14.0f),
                     ImVec2(hx + 10.0f + (leftWidth - 20.0f) * pkv, y + rowHeight - 8.0f),
-                    pkv > 0.9f ? IM_COL32(255, 80, 70, 255) : IM_COL32(80, 220, 120, 255));
+                    pkv > 0.9f ? IM_COL32(245, 105, 97, 255) : IM_COL32(85, 210, 173, 255));
             }
 
             draw->AddRectFilled(
                 ImVec2(hx, origin.y), ImVec2(hx + leftWidth, origin.y + 35.0f),
-                IM_COL32(30, 30, 34, 255));
-            draw->AddText(ImVec2(hx + 10.0f, origin.y + 10.0f), IM_COL32(170, 170, 180, 255), "TRACKS");
+                IM_COL32(27, 37, 50, 255));
+            draw->AddText(ImVec2(hx + 12.0f, origin.y + 10.0f),
+                IM_COL32(169, 196, 210, 255), "TRACK / BAR");
         }
 
+        draw->PushClipRect(ImVec2(contentMinX, viewMinY), ImVec2(viewMaxX, viewMaxY), true);
         for (const auto& mk : markers)
         {
             const float mx = origin.x + leftWidth + mk.beat * pixelsPerBeat;
+            if (mx < contentMinX || mx > viewMaxX) continue;
             draw->AddLine(ImVec2(mx, origin.y), ImVec2(mx, areaMax.y), IM_COL32(120, 200, 255, 140), 1.0f);
             draw->AddTriangleFilled(ImVec2(mx, origin.y + 28.0f), ImVec2(mx + 8.0f, origin.y + 18.0f),
                 ImVec2(mx - 0.0f, origin.y + 18.0f), IM_COL32(120, 200, 255, 255));
@@ -5460,9 +5787,13 @@ else audioError = "Select a track first."; } },
         draw->AddLine(
             ImVec2(playheadX, origin.y),
             ImVec2(playheadX, areaMax.y),
-            IM_COL32(255, 70, 70, 255),
+            IM_COL32(255, 172, 92, 255),
             2.0f
         );
+        draw->AddTriangleFilled(ImVec2(playheadX - 6.0f, origin.y),
+            ImVec2(playheadX + 6.0f, origin.y), ImVec2(playheadX, origin.y + 9.0f),
+            IM_COL32(255, 172, 92, 255));
+        draw->PopClipRect();
 
         if (followPlayhead && playing)
         {
@@ -5542,10 +5873,14 @@ else audioError = "Select a track first."; } },
 
             projectDirty = (h != savedHash);
 
-            if (projectDirty != lastTitleDirty)
+            const std::string windowTitle = (projectDirty ? "* " : "") +
+                (currentProjectPath.empty() ? std::string("Untitled") :
+                    std::filesystem::path(currentProjectPath).filename().string()) +
+                " | EasyMix Studio";
+            if (windowTitle != lastWindowTitle)
             {
-                glfwSetWindowTitle(window, projectDirty ? "*EasyMix Studio 1.0" : "EasyMix Studio 1.1 | Vocal Workstation");
-                lastTitleDirty = projectDirty;
+                glfwSetWindowTitle(window, windowTitle.c_str());
+                lastWindowTitle = windowTitle;
             }
         }
 
@@ -5582,12 +5917,7 @@ else audioError = "Select a track first."; } },
 
         glViewport(0, 0, width, height);
 
-        glClearColor(
-            0.10f,
-            0.10f,
-            0.12f,
-            1.0f
-        );
+        glClearColor(0.055f, 0.067f, 0.09f, 1.0f);
 
         glClear(GL_COLOR_BUFFER_BIT);
 
@@ -5611,14 +5941,18 @@ else audioError = "Select a track first."; } },
 
     audioClips.clear();
 
-    if (recordingState.active.load())
+    if (recordingState.active.load() || recordingState.writer.joinable())
     {
-        recordingState.active.store(false);
+        recordingState.active.store(false, std::memory_order_release);
 
         if (micAvailable)
             ma_device_stop(&captureDevice);
 
+        recordingState.writerRunning.store(false, std::memory_order_release);
+        recordingState.wake.notify_one();
+        if (recordingState.writer.joinable()) recordingState.writer.join();
         ma_encoder_uninit(&recordingState.encoder);
+        recordingState.ring.reset();
     }
 
     if (micAvailable)

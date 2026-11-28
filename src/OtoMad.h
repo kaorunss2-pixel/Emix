@@ -1,11 +1,10 @@
 #pragma once
-// EasyMix Studio: OtoMad Studio (音MAD制作パック)
-//  - サンプルのルート音程を自動検出 (YIN)
-//  - MIDIノート -> 音程を合わせたオーディオクリップへ一括焼き込み
-//      ピッチ方式: Tape(速度も変わる王道音MAD) / Keep length(WSOLA, 長さ維持)
-//      長さ方式  : Natural / Trim to note / Fit to note(ノート長に合わせて伸縮)
-//      Velocity連動, 自動音量(RMS揃え), N個ごとに逆再生, 次ノートでカット(モノ)
-//  - 選択クリップ: 音程変更(長さ維持) / 拍数に合わせて伸縮 / 自動音量
+// EasyMix Studio: OtoMad audio slicing, pitch detection and timing tools.
+//  - Detect the root pitch of a sample (YIN).
+//  - Build audio clips from MIDI notes, with tape or WSOLA pitch modes.
+//  - Natural, trim-to-note and fit-to-note duration modes.
+//  - Velocity/RMS matching, fades, reversal and note muting.
+//  - Clip pitch and time-stretch processing.
 #include <imgui.h>
 
 #include <algorithm>
